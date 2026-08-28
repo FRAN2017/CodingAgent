@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from pathlib import Path
 from typing import Annotated
 
@@ -9,15 +10,34 @@ import typer
 from rich.console import Console
 
 from coding_agent.agent import Agent, AgentError
-from coding_agent.config import Config, ConfigurationError
-from coding_agent.llm_client import DeepSeekClient
+from coding_agent.config import ConfigurationError, DeepseekConfig, QianwenConfig
+from coding_agent.llm_client import DeepSeekClient, QianwenClient
+from coding_agent.protocol import ChatClient
 
 app = typer.Typer(
     name="coding-agent",
-    help="A minimal coding agent powered by DeepSeek tool calling.",
+    help="A minimal coding agent powered by model-native tool calling.",
     no_args_is_help=True,
 )
+
 console = Console()
+
+
+class Provider(str, Enum):
+    deepseek = "deepseek"
+    qianwen = "qianwen"
+
+
+def create_client(provider: Provider) -> tuple[ChatClient, str]:
+    if provider == Provider.deepseek:
+        config = DeepseekConfig.from_env()
+        return DeepSeekClient(config), config.model
+
+    if provider == Provider.qianwen:
+        config = QianwenConfig.from_env()
+        return QianwenClient(config), config.model
+
+    raise ConfigurationError(f"Unsupported provider: {provider}")
 
 
 @app.callback()
@@ -45,7 +65,17 @@ def run(
             max=100,
             help="Maximum number of model turns",
         ),
-    ] = 10,
+    ] = 20,
+    provider: Annotated[
+        Provider,
+        typer.Option(
+            "--provider",
+            "-p",
+            "--model",
+            "-m",
+            help="Choose LLM provider (the --model alias is kept for compatibility)",
+        ),
+    ] = Provider.deepseek,
 ) -> None:
     """Run one agent task."""
     try:
@@ -53,18 +83,22 @@ def run(
         if not resolved_workspace.is_dir():
             raise ValueError(f"Not a directory: {workspace}")
 
-        config = Config.from_env()
-        client = DeepSeekClient(config)
+        client, model_name = create_client(provider)
         agent = Agent(client, resolved_workspace, max_steps=max_steps)
 
         console.print(
             f"[bold cyan]coding-agent[/bold cyan]  "
-            f"model={config.model}  workspace={resolved_workspace}"
+            f"provider={provider.value}  "
+            f"model={model_name}  "
+            f"workspace={resolved_workspace}"
         )
+
         result = agent.run(task)
+
     except (ConfigurationError, AgentError, OSError, ValueError) as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
+
     except KeyboardInterrupt as exc:
         console.print("\n[yellow]Interrupted by user.[/yellow]")
         raise typer.Exit(code=130) from exc

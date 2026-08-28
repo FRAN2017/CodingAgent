@@ -1,7 +1,8 @@
 import json
+import sys
 
-from coding_agent import tools
 from coding_agent.tools import ToolRegistry
+from coding_agent.tools import filesystem as filesystem_tools
 
 
 def test_read_file_returns_numbered_lines(tmp_path):
@@ -45,7 +46,15 @@ def test_registry_exposes_read_and_list_tools(tmp_path):
 
     names = [schema["function"]["name"] for schema in registry.schemas]
 
-    assert names == ["read_file", "list_files", "write_file"]
+    assert names == [
+        "read_file",
+        "list_files",
+        "write_file",
+        "rename_file",
+        "search_text",
+        "run_command",
+        "apply_patch",
+    ]
 
 
 def test_list_files_recurses_in_stable_order_and_returns_metadata(tmp_path):
@@ -276,7 +285,7 @@ def test_write_file_rejects_escape_sensitive_paths_and_directory_target(tmp_path
 
 
 def test_write_file_enforces_utf8_byte_limit(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "MAX_WRITE_BYTES", 5)
+    monkeypatch.setattr(filesystem_tools, "MAX_WRITE_BYTES", 5)
     registry = ToolRegistry(tmp_path)
 
     result = registry.execute(
@@ -301,4 +310,200 @@ def test_write_file_arguments_are_validated(tmp_path):
     )
 
     assert missing_content["ok"] is False
+    assert extra_argument["ok"] is False
+
+
+def test_run_command_executes_program_and_captures_output(tmp_path):
+    (tmp_path / "hello.py").write_text(
+        "import sys\nprint('Hello, Agent!')\nprint('diagnostic', file=sys.stderr)\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(tmp_path)
+
+    result = registry.execute(
+        "run_command",
+        json.dumps({"argv": [sys.executable, "hello.py"], "cwd": "."}),
+    )
+
+    assert result["ok"] is True
+    assert result["exit_code"] == 0
+    assert result["stdout"] == "Hello, Agent!\n"
+    assert result["stderr"] == "diagnostic\n"
+    assert result["timed_out"] is False
+    assert result["truncated"] is False
+    assert result["duration_ms"] >= 0
+
+
+def test_run_command_resolves_python_from_current_environment(tmp_path):
+    (tmp_path / "version.py").write_text(
+        "import sys\nprint(f'{sys.version_info.major}.{sys.version_info.minor}')\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(tmp_path)
+
+    result = registry.execute(
+        "run_command", json.dumps({"argv": ["python", "version.py"]})
+    )
+
+    assert result["ok"] is True
+    assert result["stdout"].strip() == (
+        f"{sys.version_info.major}.{sys.version_info.minor}"
+    )
+
+
+def test_run_command_uses_workspace_relative_cwd(tmp_path):
+    subdirectory = tmp_path / "project"
+    subdirectory.mkdir()
+    (subdirectory / "where.py").write_text(
+        "from pathlib import Path\nprint(Path.cwd().name)\n", encoding="utf-8"
+    )
+    registry = ToolRegistry(tmp_path)
+
+    result = registry.execute(
+        "run_command",
+        json.dumps({"argv": [sys.executable, "where.py"], "cwd": "project"}),
+    )
+
+    assert result["ok"] is True
+    assert result["cwd"] == "project"
+    assert result["stdout"] == "project\n"
+
+
+def test_run_command_returns_nonzero_exit_and_stderr(tmp_path):
+    (tmp_path / "fail.py").write_text(
+        "import sys\nprint('failure detail', file=sys.stderr)\nsys.exit(3)\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(tmp_path)
+
+    result = registry.execute(
+        "run_command", json.dumps({"argv": [sys.executable, "fail.py"]})
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "nonzero_exit"
+    assert result["exit_code"] == 3
+    assert result["stderr"] == "failure detail\n"
+    assert result["timed_out"] is False
+
+
+def test_run_command_reports_missing_command(tmp_path):
+    registry = ToolRegistry(tmp_path)
+
+    result = registry.execute(
+        "run_command",
+        json.dumps({"argv": ["coding-agent-command-that-does-not-exist"]}),
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "command_not_found"
+    assert result["exit_code"] is None
+    assert result["timed_out"] is False
+
+
+def test_run_command_times_out(tmp_path):
+    (tmp_path / "slow.py").write_text(
+        "import time\nprint('started', flush=True)\ntime.sleep(5)\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(tmp_path)
+
+    result = registry.execute(
+        "run_command",
+        json.dumps(
+            {
+                "argv": [sys.executable, "slow.py"],
+                "timeout_seconds": 1,
+            }
+        ),
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "timeout"
+    assert result["exit_code"] is None
+    assert result["timed_out"] is True
+    assert "started" in result["stdout"]
+
+
+def test_run_command_truncates_large_output(tmp_path):
+    (tmp_path / "large_output.py").write_text(
+        "print('A' * 1000)\n", encoding="utf-8"
+    )
+    registry = ToolRegistry(tmp_path)
+
+    result = registry.execute(
+        "run_command",
+        json.dumps(
+            {
+                "argv": [sys.executable, "large_output.py"],
+                "max_output_chars": 200,
+            }
+        ),
+    )
+
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    assert len(result["stdout"]) == 200
+    assert "output truncated" in result["stdout"]
+
+
+def test_run_command_removes_api_key_from_child_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "must-not-reach-child")
+    (tmp_path / "environment.py").write_text(
+        "import os\nprint(os.environ.get('DEEPSEEK_API_KEY', 'missing'))\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(tmp_path)
+
+    result = registry.execute(
+        "run_command",
+        json.dumps({"argv": [sys.executable, "environment.py"]}),
+    )
+
+    assert result["ok"] is True
+    assert result["stdout"] == "missing\n"
+
+
+def test_run_command_rejects_dangerous_command_and_invalid_cwd(tmp_path):
+    (tmp_path / ".git").mkdir()
+    registry = ToolRegistry(tmp_path)
+
+    dangerous = registry.execute(
+        "run_command", json.dumps({"argv": ["shutdown", "/s"]})
+    )
+    destructive_git = registry.execute(
+        "run_command", json.dumps({"argv": ["git", "reset", "--hard"]})
+    )
+    escaped = registry.execute(
+        "run_command", json.dumps({"argv": [sys.executable, "x.py"], "cwd": ".."})
+    )
+    ignored = registry.execute(
+        "run_command",
+        json.dumps({"argv": [sys.executable, "x.py"], "cwd": ".git"}),
+    )
+
+    assert dangerous["ok"] is False
+    assert dangerous["error_type"] == "command_rejected"
+    assert destructive_git["ok"] is False
+    assert destructive_git["error_type"] == "command_rejected"
+    assert escaped["ok"] is False
+    assert "escapes" in escaped["error"]
+    assert ignored["ok"] is False
+    assert ignored["error_type"] == "invalid_working_directory"
+
+
+def test_run_command_arguments_are_validated(tmp_path):
+    registry = ToolRegistry(tmp_path)
+
+    empty_argv = registry.execute("run_command", json.dumps({"argv": []}))
+    zero_timeout = registry.execute(
+        "run_command", json.dumps({"argv": [sys.executable], "timeout_seconds": 0})
+    )
+    extra_argument = registry.execute(
+        "run_command",
+        json.dumps({"argv": [sys.executable], "unexpected": True}),
+    )
+
+    assert empty_argv["ok"] is False
+    assert zero_timeout["ok"] is False
     assert extra_argument["ok"] is False

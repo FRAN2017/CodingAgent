@@ -1,33 +1,25 @@
-"""Local tools exposed to the model."""
+"""Tools for reading, discovering, and writing workspace files."""
 
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from coding_agent.tools.base import ToolSpec
+from coding_agent.tools.workspace import (
+    is_ignored_name,
+    resolve_workspace_path,
+    workspace_relative_path,
+)
 
 MAX_FILE_BYTES = 256 * 1024
 MAX_WRITE_BYTES = 256 * 1024
 MAX_RETURN_CHARS = 40_000
-BLOCKED_NAMES = {".env"}
-IGNORED_NAMES = {
-    ".git",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".venv",
-    "__pycache__",
-    "build",
-    "dist",
-    "env",
-    "node_modules",
-    "venv",
-}
 MAX_LIST_DEPTH = 10
 MAX_LIST_ENTRIES = 1_000
 
@@ -83,78 +75,6 @@ class WriteFileInput(BaseModel):
     )
 
 
-def read_file_schema() -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": (
-                "Read selected lines from a UTF-8 text file inside the workspace. "
-                "Line numbers are included in the result."
-            ),
-            "parameters": ReadFileInput.model_json_schema(),
-        },
-    }
-
-
-def list_files_schema() -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": (
-                "List files and directories inside the workspace in stable path "
-                "order. Generated, dependency, cache, version-control, and secret "
-                "paths are omitted."
-            ),
-            "parameters": ListFilesInput.model_json_schema(),
-        },
-    }
-
-
-def write_file_schema() -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": (
-                "Create a UTF-8 text file inside the workspace or replace an "
-                "existing file when overwrite is explicitly true. The content "
-                "argument must contain the complete desired file contents."
-            ),
-            "parameters": WriteFileInput.model_json_schema(),
-        },
-    }
-
-
-def resolve_workspace_path(workspace: Path, relative_path: str) -> Path:
-    workspace = workspace.resolve()
-    candidate = Path(relative_path)
-    if candidate.is_absolute():
-        raise ValueError("Absolute paths are not allowed")
-
-    target = (workspace / candidate).resolve()
-    if not target.is_relative_to(workspace):
-        raise ValueError("Path escapes the workspace")
-    if any(part.lower() in BLOCKED_NAMES for part in target.parts):
-        raise ValueError("Access to secret configuration files is blocked")
-    return target
-
-
-def _is_ignored_name(name: str) -> bool:
-    lowered = name.lower()
-    return (
-        lowered in BLOCKED_NAMES
-        or lowered in IGNORED_NAMES
-        or lowered.endswith(".egg-info")
-    )
-
-
-def _workspace_relative_path(workspace: Path, path: Path) -> str:
-    relative = path.relative_to(workspace)
-    return "." if relative == Path(".") else relative.as_posix()
-
-
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
@@ -206,7 +126,7 @@ def list_files(workspace: Path, arguments: ListFilesInput) -> dict[str, Any]:
     root = resolve_workspace_path(workspace, arguments.path)
 
     relative_root = root.relative_to(workspace)
-    if any(_is_ignored_name(part) for part in relative_root.parts):
+    if any(is_ignored_name(part) for part in relative_root.parts):
         return {
             "ok": False,
             "error": f"Listing ignored path is not allowed: {arguments.path}",
@@ -227,14 +147,14 @@ def list_files(workspace: Path, arguments: ListFilesInput) -> dict[str, Any]:
             key=lambda child: (child.name.casefold(), child.name),
         )
         for child in children:
-            if _is_ignored_name(child.name):
+            if is_ignored_name(child.name):
                 continue
 
             if len(entries) >= arguments.limit:
                 truncated = True
                 return
 
-            relative_path = _workspace_relative_path(workspace, child)
+            relative_path = workspace_relative_path(workspace, child)
             if child.is_symlink():
                 entries.append({"path": relative_path, "type": "symlink"})
                 continue
@@ -263,7 +183,7 @@ def list_files(workspace: Path, arguments: ListFilesInput) -> dict[str, Any]:
     visit(root, 1)
     return {
         "ok": True,
-        "path": _workspace_relative_path(workspace, root),
+        "path": workspace_relative_path(workspace, root),
         "max_depth": arguments.max_depth,
         "limit": arguments.limit,
         "count": len(entries),
@@ -279,7 +199,7 @@ def write_file(workspace: Path, arguments: WriteFileInput) -> dict[str, Any]:
 
     if relative_path == Path("."):
         return {"ok": False, "error": "Cannot replace the workspace directory"}
-    if any(_is_ignored_name(part) for part in relative_path.parts):
+    if any(is_ignored_name(part) for part in relative_path.parts):
         return {
             "ok": False,
             "error": f"Writing ignored or sensitive path is not allowed: {arguments.path}",
@@ -319,7 +239,7 @@ def write_file(workspace: Path, arguments: WriteFileInput) -> dict[str, Any]:
                 "ok": False,
                 "error": (
                     f"Parent directory does not exist: "
-                    f"{_workspace_relative_path(workspace, parent)}"
+                    f"{workspace_relative_path(workspace, parent)}"
                 ),
             }
         parent.mkdir(parents=True)
@@ -329,7 +249,7 @@ def write_file(workspace: Path, arguments: WriteFileInput) -> dict[str, Any]:
             "ok": False,
             "error": (
                 f"Parent path is not a directory: "
-                f"{_workspace_relative_path(workspace, parent)}"
+                f"{workspace_relative_path(workspace, parent)}"
             ),
         }
 
@@ -361,7 +281,7 @@ def write_file(workspace: Path, arguments: WriteFileInput) -> dict[str, Any]:
 
     return {
         "ok": True,
-        "path": _workspace_relative_path(workspace, path),
+        "path": workspace_relative_path(workspace, path),
         "action": "overwritten" if existed else "created",
         "bytes_written": len(encoded_content),
         "sha256": new_sha256,
@@ -371,36 +291,34 @@ def write_file(workspace: Path, arguments: WriteFileInput) -> dict[str, Any]:
     }
 
 
-class ToolRegistry:
-    """Validates model arguments and dispatches local tools."""
-
-    def __init__(self, workspace: Path) -> None:
-        self.workspace = workspace.resolve()
-
-    @property
-    def schemas(self) -> list[dict[str, Any]]:
-        return [read_file_schema(), list_files_schema(), write_file_schema()]
-
-    def execute(self, name: str, raw_arguments: str) -> dict[str, Any]:
-        if name not in {"read_file", "list_files", "write_file"}:
-            return {"ok": False, "error": f"Unknown tool: {name}"}
-
-        try:
-            decoded = json.loads(raw_arguments)
-        except json.JSONDecodeError as exc:
-            return {"ok": False, "error": f"Invalid JSON arguments: {exc.msg}"}
-        if not isinstance(decoded, dict):
-            return {"ok": False, "error": "Tool arguments must be a JSON object"}
-
-        try:
-            if name == "read_file":
-                read_arguments = ReadFileInput.model_validate(decoded)
-                return read_file(self.workspace, read_arguments)
-            if name == "list_files":
-                list_arguments = ListFilesInput.model_validate(decoded)
-                return list_files(self.workspace, list_arguments)
-
-            write_arguments = WriteFileInput.model_validate(decoded)
-            return write_file(self.workspace, write_arguments)
-        except (ValidationError, ValueError, OSError) as exc:
-            return {"ok": False, "error": str(exc)}
+FILE_TOOLS = (
+    ToolSpec(
+        name="read_file",
+        description=(
+            "Read selected lines from a UTF-8 text file inside the workspace. "
+            "Line numbers are included in the result."
+        ),
+        input_model=ReadFileInput,
+        handler=read_file,
+    ),
+    ToolSpec(
+        name="list_files",
+        description=(
+            "List files and directories inside the workspace in stable path "
+            "order. Generated, dependency, cache, version-control, and secret "
+            "paths are omitted."
+        ),
+        input_model=ListFilesInput,
+        handler=list_files,
+    ),
+    ToolSpec(
+        name="write_file",
+        description=(
+            "Create a UTF-8 text file inside the workspace or replace an "
+            "existing file when overwrite is explicitly true. The content "
+            "argument must contain the complete desired file contents."
+        ),
+        input_model=WriteFileInput,
+        handler=write_file,
+    ),
+)
