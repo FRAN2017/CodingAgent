@@ -1,11 +1,20 @@
 # coding-agent
 
+本项目的目标是从零实现一个简化的编程 Agent。模型通信可以使用普通的 OpenAI 兼容客户端，
+但 Agent Loop、工具调度、对话历史、上下文压缩、终止条件、错误处理和结果解析必须由项目自身实现。
+项目不允许使用 LangChain/LangGraph Memory、LlamaIndex、OpenAI/Claude Agents SDK、
+AutoGen、CrewAI，也不允许包装 Claude Code、Codex、OpenCode 等现成 Agent 产品。
+真实 API Key 只能保存在环境变量或未提交的 `.env` 中，禁止写入代码、README 或 Git 历史。
+
 ## 当前已实现能力
 
 - 从环境变量读取 DeepSeek 或通义千问（Qianwen）API 配置；
 - 调用 OpenAI 兼容的 Chat Completions API，支持 DeepSeek 与 Qianwen 双提供商；
 - 解析模型原生 Tool Calling 响应；
 - 自主管理“模型 → 工具 → 模型”的 Agent Loop；
+- 自主管理完整对话历史、输入预算和确定性上下文压缩，不依赖 LangChain Memory 等现成记忆模块；
+- 将工具调用和对应工具结果作为原子块保留，避免压缩后形成无效消息序列；
+- 通过工作区内的版本化 JSON 文件保存完整会话，并使用 `--session` 在多次进程运行之间恢复；
 - 通过 `read_file` 分段读取工作区内的 UTF-8 文本文件；
 - 通过 `list_files` 递归发现工作区内的文件和目录；
 - 通过 `search_text` 在陌生仓库中定位代码、配置和符号；
@@ -16,7 +25,7 @@
 - 使用 Pydantic 校验工具参数；
 - 限制可读写文件大小和工具返回文本长度；
 - 使用最大模型轮次防止无限循环；
-- 通过 Typer 和 Rich 提供命令行界面，支持 `--model` 切换模型提供商；
+- 通过 Typer 和 Rich 提供命令行界面，支持 `--provider` 切换模型提供商；
 
 ## 当前项目目录
 
@@ -28,8 +37,19 @@ coding-agent/
 │   ├── agent.py
 │   ├── cli.py
 │   ├── config.py
+│   ├── context/
+│   │   ├── __init__.py
+│   │   ├── config.py
+│   │   ├── history.py
+│   │   ├── manager.py
+│   │   ├── summary.py
+│   │   └── token_counter.py
 │   ├── llm_client.py
 │   ├── protocol.py
+│   ├── sessions/
+│   │   ├── __init__.py
+│   │   ├── models.py
+│   │   └── store.py
 │   └── tools/
 │       ├── __init__.py
 │       ├── base.py
@@ -43,9 +63,13 @@ coding-agent/
 ├── tests/
 │   ├── test_agent.py
 │   ├── test_config.py
+│   ├── test_context.py
+│   ├── test_cli.py
 │   ├── test_llm_client.py
+│   ├── test_patch.py
 │   ├── test_rename.py
 │   ├── test_search.py
+│   ├── test_sessions.py
 │   └── test_tools.py
 ├── examples/
 │   └── demo/
@@ -75,18 +99,19 @@ coding-agent/
 
 实现项目的核心 Agent Loop，主要职责包括：
 
-1. 构造系统消息和用户任务消息；
-2. 调用模型客户端获取下一轮响应；
+1. 创建一次性历史，或根据会话 ID 恢复已有完整历史并追加用户任务；
+2. 在每次模型请求前根据上下文预算生成请求视图；
 3. 判断模型返回的是工具调用还是最终答案；
 4. 将工具调用交给 `ToolRegistry` 执行；
-5. 把工具结果作为 `role: tool` 消息加入对话历史；
-6. 持续循环，直到模型生成最终答案；
-7. 达到最大步数或收到异常响应时安全终止。
+5. 把工具调用与工具结果作为完整原子块加入对话历史；
+6. 在完整工具交互和最终回答产生后原子保存持久会话；
+7. 持续循环，直到模型生成最终答案；
+8. 达到最大步数或收到异常响应时安全终止。
 
 该文件还定义：
 
 - `SYSTEM_PROMPT`：约束模型必须使用工具读取工作区，不得虚构工具结果；
-- `AgentResult`：保存最终答案、模型轮次、工具调用次数和完整消息历史；
+- `AgentResult`：保存最终答案、模型轮次、工具调用次数和未经压缩的完整消息历史；
 - `AgentError`：表示 Agent 无法安全完成任务。
 
 #### `coding_agent/cli.py`
@@ -96,7 +121,9 @@ coding-agent/
 - 接收自然语言任务；
 - 使用 `--workspace` 或 `-w` 指定 Agent 可访问的工作区；
 - 使用 `--max-steps` 限制最大模型轮次；
-- 使用 `--model` 或 `-m` 选择模型提供商（`deepseek` 或 `qianwen`）；
+- 使用 `--provider` 或 `-p` 选择模型提供商（`deepseek` 或 `qianwen`）；
+- 兼容旧的 `--model` 或 `-m` 参数别名；
+- 使用 `--session` 或 `-s` 创建或恢复工作区内的 JSON 会话；
 - 展示提供商、模型名称、工作区、最终答案和运行统计；
 - 将配置错误、Agent 错误、文件错误和用户中断转换为清晰的终端提示。
 
@@ -109,6 +136,33 @@ coding-agent/
 - 两者共用 `thinking_enabled`、`reasoning_effort` 推理配置和 `request_timeout_seconds` 请求超时（默认 60 秒）。
 
 如果对应的 API Key 未设置，程序会抛出 `ConfigurationError`，不会在代码中使用默认密钥。
+
+#### `coding_agent/context/`
+
+实现不依赖第三方 Agent 框架的第一版对话历史与上下文管理：
+
+- `config.py`：定义输入窗口、输出预留、安全余量、近期块数量和摘要长度配置；
+- `history.py`：维护仅追加的完整历史，校验工具调用 ID，并把 assistant tool call 与全部 tool result 组成不可拆分块；
+- `token_counter.py`：使用 UTF-8 字节数进行偏保守的无依赖 Token 估算，同时计算消息和工具 Schema 成本；
+- `summary.py`：从旧工具事件生成确定性摘要，不调用模型，不把旧文件正文整段复制进上下文；
+- `manager.py`：在预算内优先返回完整历史，超预算时保留系统消息、最新用户任务和近期原子块，并压缩更早的会话与工具事件；
+- `__init__.py`：提供上下文包的稳定公开接口。
+
+这里刻意区分两份数据：`ConversationHistory` 始终保存当前会话的完整审计历史，
+`ContextManager` 只为单次模型请求构建受预算约束的临时视图，因此压缩不会破坏原始记录。
+摘要被明确标记为不可信数据；模型需要精确内容时仍应重新读取文件。
+
+#### `coding_agent/sessions/`
+
+实现不依赖数据库的完整会话持久化：
+
+- `models.py`：定义版本化 `SessionDocument`、元数据、完整消息列表和 `SessionError`；
+- `store.py`：校验会话 ID，加载并验证 JSON，通过同目录临时文件、`fsync` 和 `os.replace` 原子保存；
+- `__init__.py`：提供会话包的稳定公开接口。
+
+每个 ID 对应 `<workspace>/.coding-agent/sessions/session-<id>.json`。文件保存完整的
+system、user、assistant、tool 和 tool_calls 消息，而不是压缩后的模型请求。加载时会校验
+格式版本、工作区、提供商和工具消息配对；同一 ID 的新对话追加到原历史后再整体原子更新。
 
 #### `coding_agent/llm_client.py`
 
@@ -231,7 +285,7 @@ coding-agent/
 - 不允许绝对路径；
 - 不允许通过 `..` 或符号链接逃出工作区；
 - 不允许读取 `.env`；
-- 不允许写入 `.env`、`.git`、依赖目录、缓存或构建产物；
+- 不允许通过模型工具访问 `.env`、`.coding-agent`、`.git`、依赖目录、缓存或构建产物；
 - 目录发现会忽略版本控制目录、虚拟环境、依赖目录、缓存和构建产物；
 - `list_files` 最大递归深度为 10，单次最多返回 1,000 项；
 - `search_text` 只搜索工作区内允许访问的普通 UTF-8 文件，不跟随符号链接；
@@ -266,22 +320,51 @@ coding-agent/
 - 无限请求工具时，Agent 能按最大步数终止；
 - 模型能够调用 `write_file` 创建文件，再使用 `read_file` 回读验证；
 - 模型能够完成 `write_file → run_command → 根据输出结束` 的执行闭环。
-- 模型能够调用 `rename_file` 重命名文件，并根据工具成功结果结束任务。
+- 模型能够调用 `rename_file` 重命名文件，并根据工具成功结果结束任务；
+- 模型能够调用 `apply_patch` 完成局部修改；
+- 超出上下文预算时，请求会压缩旧事件，同时 `AgentResult.messages` 保留完整历史。
 
 #### `tests/test_config.py`
 
-测试配置读取逻辑，包括缺少 DeepSeek API Key 时拒绝启动，以及正确读取模型名称和推理开关。
-该文件仍按多提供商拆分前的旧 `Config` 接口编写，正在随配置改造同步更新（见“当前边界与下一阶段”）。
+测试 DeepSeek 与 Qianwen 的配置读取逻辑，包括缺少 API Key 时拒绝启动、环境变量覆盖、
+Qianwen 默认兼容地址，以及旧 `Config` 名称对 `DeepseekConfig` 的兼容别名。
+
+#### `tests/test_context.py`
+
+测试自研上下文管理，包括：
+
+- 预算充足时请求消息保持不变，且请求副本不会修改完整历史；
+- 超预算时旧工具事件被确定性压缩，近期工具调用和结果仍完整保留；
+- 同一轮多个工具结果组成一个不可拆分的原子块；
+- 拒绝孤立工具结果和缺失工具结果；
+- 工具 Schema 成本会计入输入预算；
+- 必需消息无法放入窗口时返回清晰错误；
+- 上下文环境变量读取、非法配置和默认 Token 估算。
+- 从完整消息恢复历史，并在多轮压缩时始终保留最新用户任务。
+
+#### `tests/test_cli.py`
+
+测试命令行客户端工厂能够根据提供商分别构造 DeepSeek 与 Qianwen 客户端，并返回实际模型名称。
 
 #### `tests/test_llm_client.py`
 
-通过 Mock 对象测试 DeepSeek 适配层是否：
+通过 Mock 对象测试 DeepSeek 与 Qianwen 适配层是否：
 
 - 构造正确的模型请求；
-- 启用 Tool Calling 和推理配置；
+- 启用 Tool Calling，并按各提供商要求传递推理配置；
 - 正确解析模型返回的工具名称、参数和结束原因。
 
-测试不会发起真实网络请求。该文件同样仍引用旧的 `Config` 构造方式，正在随多提供商改造同步更新。
+测试不会发起真实网络请求。
+
+#### `tests/test_sessions.py`
+
+测试 JSON 会话持久化，包括：
+
+- 完整历史往返加载，并在同一 ID 下追加新 user/assistant 而不丢失旧消息；
+- 会话 ID 路径安全、格式版本、损坏 JSON 和工作区绑定校验；
+- 原子替换失败时保留原会话文件；
+- 两次独立 Agent 运行使用同一 ID 恢复历史；
+- 模型文件工具无法读取、写入或发现 `.coding-agent` 会话状态。
 
 #### `tests/test_tools.py`
 
@@ -328,6 +411,11 @@ coding-agent/
 - 原子移动失败时保留原始文件；
 - 拒绝缺失参数和 Schema 之外的额外参数。
 
+#### `tests/test_patch.py`
+
+测试 `apply_patch` 的独立补丁行为，包括裸 hunk、包装格式、CRLF 保留、多 hunk、
+行号消歧、模糊匹配拒绝、计数与重叠校验、路径校验、原子失败和文件权限保留。
+
 ### 配置与工程文件
 
 #### `examples/demo/README.md`
@@ -336,11 +424,13 @@ coding-agent/
 
 #### `.env.example`
 
-提供 DeepSeek 环境变量模板，只包含占位符，不包含真实 API Key。真实配置应放在未提交的 `.env` 中。
+提供 DeepSeek、Qianwen 和上下文预算的环境变量模板，只包含占位符，不包含真实 API Key。
+真实配置应放在未提交的 `.env` 中。
 
 #### `.gitignore`
 
-忽略虚拟环境、`.env`、Python 缓存、测试缓存、覆盖率文件、构建产物和常见编辑器临时文件，防止密钥和本地生成内容被提交。
+忽略虚拟环境、`.env`、`.coding-agent` 会话状态、Python 缓存、测试缓存、覆盖率文件、
+构建产物和常见编辑器临时文件，防止密钥和本地生成内容被提交。
 
 #### `pyproject.toml`
 
@@ -352,8 +442,8 @@ coding-agent/
 
 #### `run-agent.ps1`
 
-PowerShell 启动脚本。自动读取 `.env`、校验 `DEEPSEEK_API_KEY`、优先使用项目
-`.venv` 中的 Python，并把任务、工作区和最大轮次参数传递给 `coding_agent`。
+PowerShell 启动脚本。自动读取 `.env`，根据 `-Provider` 校验对应 API Key，优先使用项目
+`.venv` 中的 Python，并把任务、工作区、最大轮次、提供商和可选会话 ID 传递给 `coding_agent`。
 `-CheckConfig` 模式只验证配置，不调用模型或显示密钥。
 
 #### `README.md`
@@ -370,9 +460,9 @@ pip install -r requirement.txt
 
 ## 运行 Agent
 
-项目提供 `run-agent.ps1`，可以自动读取项目根目录的 `.env`、校验 API Key、
-选择 `.venv` 中的 Python 并启动 Agent。该脚本当前校验的是 DeepSeek 配置；
-使用 Qianwen 提供商请直接以 `python -m coding_agent run` 方式运行。
+项目提供 `run-agent.ps1`，可以自动读取项目根目录的 `.env`、根据提供商校验 API Key、
+选择 `.venv` 中的 Python 并启动 Agent。默认提供商为 DeepSeek，也可通过
+`-Provider qianwen` 切换到 Qianwen。
 
 只检查 `.env` 是否能够正确加载（不会显示密钥）：
 
@@ -429,7 +519,16 @@ steps=2 tool_calls=1
 python -m coding_agent run `
   "请阅读 README.md，并告诉我计算器代码应该放在哪里" `
   --workspace .\examples\demo `
-  --model qianwen
+  --provider qianwen
+```
+
+也可以通过启动脚本运行 Qianwen：
+
+```powershell
+.\run-agent.ps1 `
+  "请阅读 README.md，并总结这个项目" `
+  -Workspace . `
+  -Provider qianwen
 ```
 
 验证写入和执行闭环：
@@ -453,6 +552,80 @@ list_files
 该任务会在演示工作区创建并执行 `hello.py`。如果文件已经存在，模型必须显式
 传入 `overwrite=true` 才能覆盖。
 
+## 持久会话
+
+使用 `--session`（启动脚本中为 `-Session`）可以把完整对话历史保存在当前工作区。
+第一次使用某个 ID 时创建会话：
+
+```powershell
+.\run-agent.ps1 `
+  "创建 calculator.py，实现加减乘除并运行验证" `
+  -Workspace .\examples\demo `
+  -Session calculator
+```
+
+再次使用同一个 ID 时恢复全部旧消息，再追加当前任务：
+
+```powershell
+.\run-agent.ps1 `
+  "修改上一次写的代码，让除数为零时抛出异常，并重新验证" `
+  -Workspace .\examples\demo `
+  -Session calculator
+```
+
+也可以直接使用模块入口：
+
+```powershell
+python -m coding_agent run `
+  "继续上一次任务" `
+  --workspace .\examples\demo `
+  --session calculator
+```
+
+会话文件位于：
+
+```text
+examples/demo/.coding-agent/sessions/session-calculator.json
+```
+
+同一 ID 会加载旧 JSON，将本次 user、assistant 和 tool 消息追加到内存历史后，再通过
+临时文件整体原子更新；文件替换不会删除之前的消息。不同 ID 使用不同文件。不传
+`--session` 时保持原来的一次性模式，不创建 `.coding-agent`。会话与规范化工作区和
+提供商绑定；ID 只允许 1～64 位字母、数字、下划线和连字符，并且必须以字母或数字开头。
+
+`.coding-agent` 已加入 Git 和模型工具忽略规则。会话文件可能包含读取过的代码片段和命令输出，
+不应提交到仓库。当前第一版不支持并发写入同一会话；工具执行产生副作用后、会话保存前若进程
+异常终止，恢复时仍应要求 Agent 重新读取文件并核对工作区状态。
+
+## 对话历史与上下文预算
+
+第一版上下文管理完全由项目代码实现，不使用 LangChain Memory、LlamaIndex、
+Agents SDK、AutoGen、CrewAI 等现成 Agent 或记忆模块。默认配置为：
+
+```dotenv
+CODING_AGENT_CONTEXT_TOKENS=65536
+CODING_AGENT_OUTPUT_RESERVE=8192
+CODING_AGENT_CONTEXT_SAFETY_MARGIN=2048
+CODING_AGENT_RECENT_BLOCKS=6
+CODING_AGENT_SUMMARY_MAX_CHARS=8000
+```
+
+可用于模型输入的预算为：
+
+```text
+模型上下文窗口 - 输出预留 - 安全余量 - 工具 Schema 估算
+```
+
+当完整历史能够放入预算时，模型会收到原始消息；超出预算后，系统消息和最新用户任务始终保留，
+最近的当前轮工具交互按原子块保留，更早的用户、助手和工具事件会生成确定性摘要。摘要只记录
+任务概要、文件路径、操作结果、哈希和命令退出码等必要证据，不通过额外模型调用生成。默认
+Token 估算不依赖特定厂商 tokenizer，而是按 UTF-8 字节数偏保守估计，实际部署时应根据所用
+模型窗口调整上述参数。
+
+启用 `--session` 后，完整历史会跨进程保存在 JSON 中，但每次发送给模型的仍然只是预算内请求视图。
+当前第一版不提供长期语义记忆、向量检索、会话分支、并发会话锁或云端同步；后续能力仍应基于
+自有数据结构实现，而不是接入现成 Agent Memory。
+
 ## 命令执行安全边界
 
 `run_command` 是带路径、参数、超时、输出和环境变量限制的本地执行器，但不是
@@ -472,20 +645,3 @@ pytest
 ruff check .
 ```
 
-## 当前边界与下一阶段
-
-当前版本已经具备“发现文件 → 搜索文本 → 读取文件 → 写入或重命名文件 → 执行并观察结果”的最小编程闭环，并支持 DeepSeek 与通义千问（Qianwen）双提供商。
-
-当前进度中的未完成部分：
-
-- `apply_patch` 已接入 `ToolRegistry` 默认工具集；其自动化测试尚未补全；
-- `test_config.py` 与 `test_llm_client.py` 仍按多提供商拆分前的旧 `Config` 接口编写，`pytest` 目前会在收集阶段失败，需要随配置改造同步更新。
-
-下一阶段计划依次实现：
-
-```text
-补全 apply_patch 的自动化测试
-→ 更新 test_config.py / test_llm_client.py 以覆盖多提供商配置与客户端
-→ 测试失败后的自动修复
-→ 基于验证证据的完成判定
-```

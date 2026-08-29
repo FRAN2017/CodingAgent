@@ -4,6 +4,7 @@ import sys
 import pytest
 
 from coding_agent.agent import Agent, AgentError
+from coding_agent.context import ContextConfig
 from coding_agent.protocol import ModelTurn, ToolCall
 
 
@@ -322,3 +323,83 @@ def test_agent_can_apply_a_localized_patch(tmp_path):
     assert result.tool_calls == 1
     assert client.call_count == 2
     assert target.read_text(encoding="utf-8") == "return a + b\n"
+
+
+class CharacterCounterWithoutSchemas:
+    def count_messages(self, messages):
+        return len(json.dumps(messages, ensure_ascii=False))
+
+    def count_tools(self, tools):
+        return 0
+
+
+class ContextCompactionClient:
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def complete(self, messages, tools):
+        self.call_count += 1
+        if self.call_count <= 2:
+            return ModelTurn(
+                content=None,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCall(
+                        id=f"read_{self.call_count}",
+                        name="read_file",
+                        arguments=json.dumps(
+                            {"path": f"large_{self.call_count}.txt"}
+                        ),
+                    )
+                ],
+            )
+
+        summaries = [
+            message["content"]
+            for message in messages
+            if message["role"] == "system"
+            and "Earlier conversation summary" in message["content"]
+        ]
+        assert len(summaries) == 1
+        assert "large_1.txt" in summaries[0]
+        assert messages[-2]["role"] == "assistant"
+        assert messages[-1]["role"] == "tool"
+        assert messages[-1]["tool_call_id"] == "read_2"
+        return ModelTurn(content="Context was compacted safely.", finish_reason="stop")
+
+
+def test_agent_compacts_request_but_preserves_full_audit_history(tmp_path):
+    for number in (1, 2):
+        (tmp_path / f"large_{number}.txt").write_text(
+            "x" * 2_500,
+            encoding="utf-8",
+        )
+    client = ContextCompactionClient()
+    agent = Agent(
+        client,
+        tmp_path,
+        max_steps=4,
+        context_config=ContextConfig(
+            max_context_tokens=6_500,
+            reserved_output_tokens=0,
+            safety_margin_tokens=0,
+            recent_blocks=1,
+            summary_max_chars=512,
+        ),
+        token_counter=CharacterCounterWithoutSchemas(),
+    )
+
+    result = agent.run("Read both large files before answering.")
+
+    assert result.final_answer == "Context was compacted safely."
+    assert result.steps == 3
+    assert result.tool_calls == 2
+    assert [message["role"] for message in result.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+        "assistant",
+    ]

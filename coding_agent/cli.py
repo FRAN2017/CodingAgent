@@ -11,8 +11,10 @@ from rich.console import Console
 
 from coding_agent.agent import Agent, AgentError
 from coding_agent.config import ConfigurationError, DeepseekConfig, QianwenConfig
+from coding_agent.context import ContextConfig
 from coding_agent.llm_client import DeepSeekClient, QianwenClient
 from coding_agent.protocol import ChatClient
+from coding_agent.sessions import JsonSessionStore, SessionError
 
 app = typer.Typer(
     name="coding-agent",
@@ -76,6 +78,14 @@ def run(
             help="Choose LLM provider (the --model alias is kept for compatibility)",
         ),
     ] = Provider.deepseek,
+    session: Annotated[
+        str | None,
+        typer.Option(
+            "--session",
+            "-s",
+            help="Create or resume a JSON session in the workspace",
+        ),
+    ] = None,
 ) -> None:
     """Run one agent task."""
     try:
@@ -84,18 +94,37 @@ def run(
             raise ValueError(f"Not a directory: {workspace}")
 
         client, model_name = create_client(provider)
-        agent = Agent(client, resolved_workspace, max_steps=max_steps)
+        session_store = (
+            JsonSessionStore(resolved_workspace) if session is not None else None
+        )
+        agent = Agent(
+            client,
+            resolved_workspace,
+            max_steps=max_steps,
+            context_config=ContextConfig.from_env(),
+            session_store=session_store,
+            session_id=session,
+            provider=provider.value if session is not None else None,
+            model=model_name if session is not None else None,
+        )
 
         console.print(
             f"[bold cyan]coding-agent[/bold cyan]  "
             f"provider={provider.value}  "
             f"model={model_name}  "
             f"workspace={resolved_workspace}"
+            + (f"  session={session}" if session is not None else "")
         )
 
         result = agent.run(task)
 
-    except (ConfigurationError, AgentError, OSError, ValueError) as exc:
+    except (
+        ConfigurationError,
+        AgentError,
+        SessionError,
+        OSError,
+        ValueError,
+    ) as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
 

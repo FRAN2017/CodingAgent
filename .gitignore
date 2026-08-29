@@ -150,6 +150,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+.coding-agent/
 .venv
 env/
 venv/
@@ -202,6 +203,9 @@ cython_debug/
 # .vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
+
+# Local agent examples and disposable test workspaces
+examples/
 
 # Ruff stuff:
 .ruff_cache/

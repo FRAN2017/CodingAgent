@@ -11,6 +11,8 @@ param(
     [ValidateSet("deepseek", "qianwen")]
     [string]$Provider = "deepseek",
 
+    [string]$Session,
+
     [string]$EnvFile = (Join-Path $PSScriptRoot ".env"),
 
     [switch]$CheckConfig
@@ -100,8 +102,21 @@ else {
     $python = $pythonCommand.Source
 }
 
-& $python -m coding_agent run $Task `
-    --workspace $Workspace `
-    --max-steps $MaxSteps `
-    --provider $Provider
+$agentArguments = @(
+    "-m",
+    "coding_agent",
+    "run",
+    $Task,
+    "--workspace",
+    $Workspace,
+    "--max-steps",
+    $MaxSteps,
+    "--provider",
+    $Provider
+)
+if (-not [string]::IsNullOrWhiteSpace($Session)) {
+    $agentArguments += @("--session", $Session)
+}
+
+& $python @agentArguments
 exit $LASTEXITCODE

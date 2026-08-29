@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-BLOCKED_NAMES = {".env"}
+BLOCKED_NAMES = {".coding-agent", ".env"}
 IGNORED_NAMES = {
     ".git",
     ".mypy_cache",
@@ -31,7 +31,7 @@ def resolve_workspace_path(workspace: Path, relative_path: str) -> Path:
     if not target.is_relative_to(workspace):
         raise ValueError("Path escapes the workspace")
     if any(part.lower() in BLOCKED_NAMES for part in target.parts):
-        raise ValueError("Access to secret configuration files is blocked")
+        raise ValueError("Access to protected workspace state is blocked")
     return target
 
 
