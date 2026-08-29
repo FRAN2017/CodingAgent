@@ -14,7 +14,7 @@ AutoGen、CrewAI，也不允许包装 Claude Code、Codex、OpenCode 等现成 A
 - 自主管理“模型 → 工具 → 模型”的 Agent Loop；
 - 自主管理完整对话历史、输入预算和确定性上下文压缩，不依赖 LangChain Memory 等现成记忆模块；
 - 将工具调用和对应工具结果作为原子块保留，避免压缩后形成无效消息序列；
-- 通过工作区内的版本化 JSON 文件保存完整会话，并使用 `--session` 在多次进程运行之间恢复；
+- 通过工作区内的版本化 JSON 文件保存原始完整会话，恢复时可切换 DeepSeek 与 Qianwen；
 - 通过 `read_file` 分段读取工作区内的 UTF-8 文本文件；
 - 通过 `list_files` 递归发现工作区内的文件和目录；
 - 通过 `search_text` 在陌生仓库中定位代码、配置和符号；
@@ -25,7 +25,8 @@ AutoGen、CrewAI，也不允许包装 Claude Code、Codex、OpenCode 等现成 A
 - 使用 Pydantic 校验工具参数；
 - 限制可读写文件大小和工具返回文本长度；
 - 使用最大模型轮次防止无限循环；
-- 通过 Typer 和 Rich 提供命令行界面，支持 `--provider` 切换模型提供商；
+- 分类处理模型超时、连接、鉴权、限流、HTTP 状态和非法响应错误；
+- 通过 Typer 和 Rich 提供单次任务与 `>>` 持续交互模式，支持 `--provider` 切换模型提供商；
 
 ## 当前项目目录
 
@@ -48,6 +49,7 @@ coding-agent/
 │   ├── protocol.py
 │   ├── sessions/
 │   │   ├── __init__.py
+│   │   ├── adapter.py
 │   │   ├── models.py
 │   │   └── store.py
 │   └── tools/
@@ -119,21 +121,23 @@ coding-agent/
 实现命令行界面。当前提供 `run` 命令，支持：
 
 - 接收自然语言任务；
+- 省略任务参数时进入持续交互模式，复用同一个 Agent 和会话；
 - 使用 `--workspace` 或 `-w` 指定 Agent 可访问的工作区；
 - 使用 `--max-steps` 限制最大模型轮次；
 - 使用 `--provider` 或 `-p` 选择模型提供商（`deepseek` 或 `qianwen`）；
 - 兼容旧的 `--model` 或 `-m` 参数别名；
 - 使用 `--session` 或 `-s` 创建或恢复工作区内的 JSON 会话；
+- 支持用 `quit`、`exit`、`q` 或 `退出` 结束交互模式；
 - 展示提供商、模型名称、工作区、最终答案和运行统计；
-- 将配置错误、Agent 错误、文件错误和用户中断转换为清晰的终端提示。
+- 将配置、模型 API、Agent、会话、文件错误和用户中断转换为清晰的终端提示。
 
 #### `coding_agent/config.py`
 
 负责从进程环境变量读取提供商配置。当前支持两套参数：
 
-- `DeepseekConfig`：读取 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`、`DEEPSEEK_THINKING`、`DEEPSEEK_REASONING_EFFORT`；
-- `QianwenConfig`：读取 `QIANWEN_API_KEY`、`QIANWEN_BASE_URL`、`QIANWEN_MODEL`、`QIANWEN_THINKING`、`QIANWEN_REASONING_EFFORT`；
-- 两者共用 `thinking_enabled`、`reasoning_effort` 推理配置和 `request_timeout_seconds` 请求超时（默认 60 秒）。
+- `DeepseekConfig`：读取 DeepSeek 的 API Key、地址、模型、推理、请求超时和重试次数；
+- `QianwenConfig`：读取 Qianwen 的 API Key、地址、模型、推理、请求超时和重试次数；
+- 请求超时默认每次尝试 180 秒，可配置为 1～3,600 秒；SDK 重试默认 2 次，可配置为 0～10 次。
 
 如果对应的 API Key 未设置，程序会抛出 `ConfigurationError`，不会在代码中使用默认密钥。
 
@@ -156,13 +160,14 @@ coding-agent/
 
 实现不依赖数据库的完整会话持久化：
 
-- `models.py`：定义版本化 `SessionDocument`、元数据、完整消息列表和 `SessionError`；
+- `models.py`：定义版本化 `SessionDocument`、提供商历史分段、完整消息列表和 `SessionError`；
+- `adapter.py`：根据目标提供商生成请求副本，移除其他提供商专属的 `reasoning_content`；
 - `store.py`：校验会话 ID，加载并验证 JSON，通过同目录临时文件、`fsync` 和 `os.replace` 原子保存；
 - `__init__.py`：提供会话包的稳定公开接口。
 
 每个 ID 对应 `<workspace>/.coding-agent/sessions/session-<id>.json`。文件保存完整的
 system、user、assistant、tool 和 tool_calls 消息，而不是压缩后的模型请求。加载时会校验
-格式版本、工作区、提供商和工具消息配对；同一 ID 的新对话追加到原历史后再整体原子更新。
+格式版本、工作区、提供商分段和工具消息配对；同一 ID 的新对话追加到原历史后再整体原子更新。
 
 #### `coding_agent/llm_client.py`
 
@@ -171,6 +176,8 @@ system、user、assistant、tool 和 tool_calls 消息，而不是压缩后的�
 - 使用 `openai` Python 客户端连接各自配置的 OpenAI 兼容地址；
 - 构造包含模型、消息、工具和推理配置的请求；
 - 解析模型返回的文本、`finish_reason` 和 Tool Calls；
+- 将超时、连接、鉴权、权限、限流、错误请求和服务端状态分类转换为安全的 `ModelClientError`；
+- 校验 `choices`、message、正文、结束原因和每个 tool call 的必需字段，拒绝结构损坏的响应；
 - 将 SDK 返回对象统一转换为项目内部的 `ModelTurn` 和 `ToolCall`。
 
 这种隔离设计使 Agent 核心逻辑不直接依赖厂商 SDK 的数据结构，也方便在测试中替换为 Fake Client。
@@ -181,6 +188,7 @@ system、user、assistant、tool 和 tool_calls 消息，而不是压缩后的�
 
 - `ToolCall`：保存工具调用 ID、工具名称和原始 JSON 参数，并提供 `as_api_dict()` 生成可加入 assistant 消息的 tool_calls 数据；
 - `ModelTurn`：保存一次模型响应的正文、工具调用、结束原因和推理内容；
+- `ModelClientError`：保存安全错误消息、错误类别、是否可重试和可选 HTTP 状态码；
 - `ChatClient`：通过 Python `Protocol` 描述模型客户端必须提供的 `complete` 接口。
 
 `ModelTurn.as_assistant_message()` 会将内部对象重新转换成可加入 API 对话历史的 assistant 消息。
@@ -327,7 +335,7 @@ system、user、assistant、tool 和 tool_calls 消息，而不是压缩后的�
 #### `tests/test_config.py`
 
 测试 DeepSeek 与 Qianwen 的配置读取逻辑，包括缺少 API Key 时拒绝启动、环境变量覆盖、
-Qianwen 默认兼容地址，以及旧 `Config` 名称对 `DeepseekConfig` 的兼容别名。
+超时和重试范围校验、Qianwen 默认兼容地址，以及旧 `Config` 名称对 `DeepseekConfig` 的兼容别名。
 
 #### `tests/test_context.py`
 
@@ -344,7 +352,8 @@ Qianwen 默认兼容地址，以及旧 `Config` 名称对 `DeepseekConfig` 的�
 
 #### `tests/test_cli.py`
 
-测试命令行客户端工厂能够根据提供商分别构造 DeepSeek 与 Qianwen 客户端，并返回实际模型名称。
+测试命令行客户端工厂能够根据提供商分别构造 DeepSeek 与 Qianwen 客户端，并验证单次错误输出、
+交互循环、Agent 复用、退出命令和任务失败后的继续提问。
 
 #### `tests/test_llm_client.py`
 
@@ -352,7 +361,9 @@ Qianwen 默认兼容地址，以及旧 `Config` 名称对 `DeepseekConfig` 的�
 
 - 构造正确的模型请求；
 - 启用 Tool Calling，并按各提供商要求传递推理配置；
-- 正确解析模型返回的工具名称、参数和结束原因。
+- 正确解析模型返回的工具名称、参数和结束原因；
+- 将超时、连接、鉴权、限流和服务端错误转换成分类的安全错误；
+- 拒绝空 choices 和字段不完整的 tool call。
 
 测试不会发起真实网络请求。
 
@@ -424,7 +435,7 @@ Qianwen 默认兼容地址，以及旧 `Config` 名称对 `DeepseekConfig` 的�
 
 #### `.env.example`
 
-提供 DeepSeek、Qianwen 和上下文预算的环境变量模板，只包含占位符，不包含真实 API Key。
+提供 DeepSeek、Qianwen、请求超时、重试和上下文预算的环境变量模板，只包含占位符，不包含真实 API Key。
 真实配置应放在未提交的 `.env` 中。
 
 #### `.gitignore`
@@ -443,7 +454,8 @@ Qianwen 默认兼容地址，以及旧 `Config` 名称对 `DeepseekConfig` 的�
 #### `run-agent.ps1`
 
 PowerShell 启动脚本。自动读取 `.env`，根据 `-Provider` 校验对应 API Key，优先使用项目
-`.venv` 中的 Python，并把任务、工作区、最大轮次、提供商和可选会话 ID 传递给 `coding_agent`。
+`.venv` 中的 Python，并把可选任务、工作区、最大轮次、提供商和会话 ID 传递给 `coding_agent`。
+省略任务时直接进入持续交互模式。
 `-CheckConfig` 模式只验证配置，不调用模型或显示密钥。
 
 #### `README.md`
@@ -463,6 +475,39 @@ pip install -r requirement.txt
 项目提供 `run-agent.ps1`，可以自动读取项目根目录的 `.env`、根据提供商校验 API Key、
 选择 `.venv` 中的 Python 并启动 Agent。默认提供商为 DeepSeek，也可通过
 `-Provider qianwen` 切换到 Qianwen。
+
+### 持续交互模式
+
+启动时不提供任务，就会进入 `>>` 循环：
+
+```powershell
+.\run-agent.ps1 `
+  -Workspace C:\Users\FRAN\Desktop\test `
+  -MaxSteps 20 `
+  -Provider qianwen `
+  -Session 1
+```
+
+启动后可以连续输入任务：
+
+```text
+coding-agent  provider=qianwen  model=...  workspace=...  session=1
+Interactive mode  输入编程任务，输入 quit、exit 或退出结束。
+
+>> 查看当前项目结构并总结
+...
+Completed
+
+>> 修改刚才分析的代码并运行测试
+...
+Completed
+
+>> quit
+会话已结束。
+```
+
+这里的 `-Session 1` 会让每个问题共享并持久化完整对话历史；关闭程序后，再用相同工作区和
+Session ID 启动仍可继续原会话。不传 `-Session` 也能交互，但每个问题的历史彼此独立。
 
 只检查 `.env` 是否能够正确加载（不会显示密钥）：
 
@@ -531,6 +576,19 @@ python -m coding_agent run `
   -Provider qianwen
 ```
 
+模型请求的超时和 SDK 自动重试可在 `.env` 中分别配置：
+
+```dotenv
+DEEPSEEK_REQUEST_TIMEOUT_SECONDS=180
+DEEPSEEK_MAX_RETRIES=2
+QIANWEN_REQUEST_TIMEOUT_SECONDS=180
+QIANWEN_MAX_RETRIES=2
+```
+
+发生超时、连接失败、鉴权失败、限流、错误请求或服务端异常时，CLI 会输出一条分类后的
+简洁错误，不再展示底层 HTTP Traceback。超时是每次请求尝试的上限；开启 thinking 的复杂
+任务可适当提高该值，限流和服务端错误则应结合提示等待后重试。
+
 验证写入和执行闭环：
 
 ```powershell
@@ -590,8 +648,15 @@ examples/demo/.coding-agent/sessions/session-calculator.json
 
 同一 ID 会加载旧 JSON，将本次 user、assistant 和 tool 消息追加到内存历史后，再通过
 临时文件整体原子更新；文件替换不会删除之前的消息。不同 ID 使用不同文件。不传
-`--session` 时保持原来的一次性模式，不创建 `.coding-agent`。会话与规范化工作区和
-提供商绑定；ID 只允许 1～64 位字母、数字、下划线和连字符，并且必须以字母或数字开头。
+`--session` 时保持原来的一次性模式，不创建 `.coding-agent`。会话与规范化工作区绑定，
+但不再与单一提供商绑定；ID 只允许 1～64 位字母、数字、下划线和连字符，并且必须以字母
+或数字开头。
+
+同一会话可以从 DeepSeek 切换到 Qianwen，也可以再切换回来。JSON 中的 assistant 原始消息
+（包括 `reasoning_content`）始终原样保存，同时用 `provider_segments` 记录各段消息的来源。
+真正请求模型时才创建深拷贝：目标提供商自己的推理字段保持不变，其他提供商产生的
+`reasoning_content` 会从请求副本中移除。转换和上下文压缩都不会反写原始会话历史。旧版
+`format_version: 1` 会话会在内存中迁移，并在下一次保存时写成版本 2。
 
 `.coding-agent` 已加入 Git 和模型工具忽略规则。会话文件可能包含读取过的代码片段和命令输出，
 不应提交到仓库。当前第一版不支持并发写入同一会话；工具执行产生副作用后、会话保存前若进程
@@ -622,7 +687,8 @@ CODING_AGENT_SUMMARY_MAX_CHARS=8000
 Token 估算不依赖特定厂商 tokenizer，而是按 UTF-8 字节数偏保守估计，实际部署时应根据所用
 模型窗口调整上述参数。
 
-启用 `--session` 后，完整历史会跨进程保存在 JSON 中，但每次发送给模型的仍然只是预算内请求视图。
+启用 `--session` 后，原始完整历史会跨进程保存在 JSON 中，但每次发送给模型的仍然只是经过
+提供商转换和上下文预算处理的请求视图。
 当前第一版不提供长期语义记忆、向量检索、会话分支、并发会话锁或云端同步；后续能力仍应基于
 自有数据结构实现，而不是接入现成 Agent Memory。
 

@@ -6,6 +6,23 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 
+class ModelClientError(RuntimeError):
+    """A safe, user-facing failure from a model API or response parser."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str,
+        retryable: bool,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.retryable = retryable
+        self.status_code = status_code
+
+
 @dataclass(frozen=True, slots=True)
 class ToolCall:
     id: str

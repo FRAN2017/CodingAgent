@@ -86,10 +86,6 @@ if ($CheckConfig) {
     exit 0
 }
 
-if ([string]::IsNullOrWhiteSpace($Task)) {
-    throw "Task is required. Example: .\run-agent.ps1 'Summarize this project'"
-}
-
 $virtualEnvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 if (Test-Path -LiteralPath $virtualEnvPython -PathType Leaf) {
     $python = $virtualEnvPython
@@ -105,8 +101,12 @@ else {
 $agentArguments = @(
     "-m",
     "coding_agent",
-    "run",
-    $Task,
+    "run"
+)
+if (-not [string]::IsNullOrWhiteSpace($Task)) {
+    $agentArguments += $Task
+}
+$agentArguments += @(
     "--workspace",
     $Workspace,
     "--max-steps",

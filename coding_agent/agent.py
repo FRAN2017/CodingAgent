@@ -14,8 +14,12 @@ from coding_agent.context import (
     ConversationHistory,
     TokenCounter,
 )
-from coding_agent.protocol import ChatClient
-from coding_agent.sessions import JsonSessionStore, SessionDocument, SessionError
+from coding_agent.protocol import ChatClient, ModelClientError
+from coding_agent.sessions import (
+    JsonSessionStore,
+    SessionDocument,
+    adapt_messages_for_provider,
+)
 from coding_agent.tools import ToolRegistry
 
 SYSTEM_PROMPT = """\
@@ -99,14 +103,18 @@ class Agent:
 
         for step in range(1, self.max_steps + 1):
             try:
+                request_history = self._history_for_request(history)
                 request_messages = self.context_manager.build_request(
-                    history,
+                    request_history,
                     self.tools.schemas,
                 )
             except ContextBudgetError as exc:
                 raise AgentError(f"Cannot build model context: {exc}") from exc
 
-            turn = self.client.complete(request_messages, self.tools.schemas)
+            try:
+                turn = self.client.complete(request_messages, self.tools.schemas)
+            except ModelClientError as exc:
+                raise AgentError(str(exc)) from exc
             history.append_assistant(turn.as_assistant_message())
 
             if turn.tool_calls:
@@ -154,11 +162,6 @@ class Agent:
                 messages=history.messages,
             )
         else:
-            if document.provider != self.provider:
-                raise SessionError(
-                    f"Session uses provider {document.provider!r}, but the current "
-                    f"provider is {self.provider!r}"
-                )
             history = ConversationHistory.from_messages(document.messages)
             self._session_document = document
 
@@ -171,6 +174,20 @@ class Agent:
             return
         self._session_document = self._session_document.with_messages(
             history.messages,
+            provider=self.provider or self._session_document.provider,
             model=self.model or self._session_document.model,
         )
         self.session_store.save(self._session_document)
+
+    def _history_for_request(
+        self,
+        history: ConversationHistory,
+    ) -> ConversationHistory:
+        if self._session_document is None:
+            return history
+        messages = adapt_messages_for_provider(
+            history.messages,
+            self._session_document.provider_segments,
+            target_provider=self.provider or self._session_document.provider,
+        )
+        return ConversationHistory.from_messages(messages)

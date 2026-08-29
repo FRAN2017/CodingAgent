@@ -9,7 +9,7 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
-from coding_agent.agent import Agent, AgentError
+from coding_agent.agent import Agent, AgentError, AgentResult
 from coding_agent.config import ConfigurationError, DeepseekConfig, QianwenConfig
 from coding_agent.context import ContextConfig
 from coding_agent.llm_client import DeepSeekClient, QianwenClient
@@ -23,6 +23,7 @@ app = typer.Typer(
 )
 
 console = Console()
+EXIT_COMMANDS = {"quit", "exit", "q", "退出"}
 
 
 class Provider(str, Enum):
@@ -50,8 +51,11 @@ def main() -> None:
 @app.command()
 def run(
     task: Annotated[
-        str, typer.Argument(help="Programming task for the agent")
-    ],
+        str | None,
+        typer.Argument(
+            help="Programming task; omit it to enter interactive mode"
+        ),
+    ] = None,
     workspace: Annotated[
         Path,
         typer.Option(
@@ -87,7 +91,7 @@ def run(
         ),
     ] = None,
 ) -> None:
-    """Run one agent task."""
+    """Run one task or start an interactive coding-agent session."""
     try:
         resolved_workspace = workspace.resolve(strict=True)
         if not resolved_workspace.is_dir():
@@ -116,6 +120,10 @@ def run(
             + (f"  session={session}" if session is not None else "")
         )
 
+        if task is None:
+            _run_interactive(agent, persistent=session is not None)
+            return
+
         result = agent.run(task)
 
     except (
@@ -132,6 +140,43 @@ def run(
         console.print("\n[yellow]Interrupted by user.[/yellow]")
         raise typer.Exit(code=130) from exc
 
+    _print_result(result)
+
+
+def _run_interactive(agent: Agent, *, persistent: bool) -> None:
+    console.print(
+        "[bold green]Interactive mode[/bold green]  "
+        "输入编程任务，输入 [bold]quit[/bold]、[bold]exit[/bold] 或"
+        " [bold]退出[/bold] 结束。"
+    )
+    if not persistent:
+        console.print(
+            "[yellow]未提供 --session；每个问题将使用独立的对话历史。[/yellow]"
+        )
+
+    while True:
+        try:
+            task = console.input("\n[bold cyan]>>[/bold cyan] ").strip()
+        except EOFError:
+            console.print("\n[yellow]输入已结束。[/yellow]")
+            return
+
+        if task.casefold() in EXIT_COMMANDS:
+            console.print("[yellow]会话已结束。[/yellow]")
+            return
+        if not task:
+            continue
+
+        try:
+            result = agent.run(task)
+        except (AgentError, SessionError, OSError, ValueError) as exc:
+            console.print(f"[bold red]Error:[/bold red] {exc}")
+            continue
+
+        _print_result(result)
+
+
+def _print_result(result: AgentResult) -> None:
     console.print("\n[bold green]Completed[/bold green]")
     console.print(result.final_answer)
     console.print(

@@ -5,7 +5,13 @@ import pytest
 from coding_agent.agent import Agent
 from coding_agent.context import ConversationHistory
 from coding_agent.protocol import ModelTurn
-from coding_agent.sessions import JsonSessionStore, SessionDocument, SessionError
+from coding_agent.sessions import (
+    JsonSessionStore,
+    ProviderSegment,
+    SessionDocument,
+    SessionError,
+    adapt_messages_for_provider,
+)
 from coding_agent.tools import ToolRegistry
 
 
@@ -46,6 +52,63 @@ def test_json_session_round_trip_and_append_preserves_history(tmp_path):
         {"role": "assistant", "content": "second answer"},
     ]
     assert path == tmp_path / ".coding-agent" / "sessions" / "session-1.json"
+
+
+def test_version_one_session_is_migrated_without_changing_messages(tmp_path):
+    store = JsonSessionStore(tmp_path)
+    original = _document(store, _completed_history())
+    legacy_data = original.to_dict()
+    legacy_data["format_version"] = 1
+    legacy_data.pop("provider_segments")
+    path = store.session_path("1")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(legacy_data), encoding="utf-8")
+
+    loaded = store.load("1")
+
+    assert loaded is not None
+    assert loaded.format_version == 2
+    assert loaded.messages == original.messages
+    assert loaded.provider_segments == (ProviderSegment(0, "deepseek"),)
+    store.save(loaded)
+    saved_data = json.loads(path.read_text(encoding="utf-8"))
+    assert saved_data["format_version"] == 2
+    assert saved_data["messages"] == legacy_data["messages"]
+    assert saved_data["provider_segments"] == [
+        {"start_index": 0, "provider": "deepseek"}
+    ]
+
+
+def test_provider_adapter_removes_only_foreign_reasoning_without_mutation():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "deepseek task"},
+        {
+            "role": "assistant",
+            "content": "deepseek answer",
+            "reasoning_content": "deepseek private reasoning",
+        },
+        {"role": "user", "content": "qianwen task"},
+        {
+            "role": "assistant",
+            "content": "qianwen answer",
+            "reasoning_content": "qianwen private reasoning",
+        },
+    ]
+    segments = (
+        ProviderSegment(0, "deepseek"),
+        ProviderSegment(3, "qianwen"),
+    )
+
+    adapted = adapt_messages_for_provider(
+        messages,
+        segments,
+        target_provider="qianwen",
+    )
+
+    assert "reasoning_content" not in adapted[2]
+    assert adapted[4]["reasoning_content"] == "qianwen private reasoning"
+    assert messages[2]["reasoning_content"] == "deepseek private reasoning"
 
 
 @pytest.mark.parametrize("session_id", ["", "../escape", "bad/id", "a" * 65])
@@ -117,6 +180,22 @@ class FinalAnswerClient:
         return ModelTurn(content=self.answer, finish_reason="stop")
 
 
+class ReasoningAnswerClient:
+    def __init__(self, answer, reasoning, inspect_request=None):
+        self.answer = answer
+        self.reasoning = reasoning
+        self.inspect_request = inspect_request
+
+    def complete(self, messages, tools):
+        if self.inspect_request is not None:
+            self.inspect_request(messages)
+        return ModelTurn(
+            content=self.answer,
+            reasoning_content=self.reasoning,
+            finish_reason="stop",
+        )
+
+
 def test_agent_resumes_complete_history_from_the_same_session(tmp_path):
     store = JsonSessionStore(tmp_path)
     first = Agent(
@@ -153,6 +232,55 @@ def test_agent_resumes_complete_history_from_the_same_session(tmp_path):
         "user",
         "assistant",
     ]
+
+
+def test_agent_switches_provider_using_a_converted_request_copy(tmp_path):
+    store = JsonSessionStore(tmp_path)
+    first = Agent(
+        ReasoningAnswerClient("deepseek answer", "deepseek reasoning"),
+        tmp_path,
+        session_store=store,
+        session_id="switch-provider",
+        provider="deepseek",
+        model="deepseek-model",
+    )
+    first.run("first task")
+
+    def inspect_qianwen_request(messages):
+        old_answer = next(
+            message
+            for message in messages
+            if message.get("content") == "deepseek answer"
+        )
+        assert "reasoning_content" not in old_answer
+
+    second = Agent(
+        ReasoningAnswerClient(
+            "qianwen answer",
+            "qianwen reasoning",
+            inspect_request=inspect_qianwen_request,
+        ),
+        tmp_path,
+        session_store=JsonSessionStore(tmp_path),
+        session_id="switch-provider",
+        provider="qianwen",
+        model="qianwen-model",
+    )
+    second.run("second task")
+
+    loaded = store.load("switch-provider")
+    assert loaded is not None
+    assert loaded.provider == "qianwen"
+    assert loaded.model == "qianwen-model"
+    assert loaded.provider_segments == (
+        ProviderSegment(0, "deepseek"),
+        ProviderSegment(3, "qianwen"),
+    )
+    assistant_messages = [
+        message for message in loaded.messages if message["role"] == "assistant"
+    ]
+    assert assistant_messages[0]["reasoning_content"] == "deepseek reasoning"
+    assert assistant_messages[1]["reasoning_content"] == "qianwen reasoning"
 
 
 def test_model_tools_cannot_access_session_state(tmp_path):

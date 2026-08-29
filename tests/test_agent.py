@@ -5,7 +5,7 @@ import pytest
 
 from coding_agent.agent import Agent, AgentError
 from coding_agent.context import ContextConfig
-from coding_agent.protocol import ModelTurn, ToolCall
+from coding_agent.protocol import ModelClientError, ModelTurn, ToolCall
 
 
 class FakeClient:
@@ -230,6 +230,22 @@ def test_agent_enforces_step_limit(tmp_path):
 
     with pytest.raises(AgentError, match="step limit"):
         agent.run("Keep reading forever")
+
+
+class FailingModelClient:
+    def complete(self, messages, tools):
+        raise ModelClientError(
+            "Qianwen request timed out",
+            category="timeout",
+            retryable=True,
+        )
+
+
+def test_agent_converts_model_client_error_to_agent_error(tmp_path):
+    agent = Agent(FailingModelClient(), tmp_path)
+
+    with pytest.raises(AgentError, match="Qianwen request timed out"):
+        agent.run("Do something")
 
 
 def test_agent_can_write_and_read_back_a_file(tmp_path):
