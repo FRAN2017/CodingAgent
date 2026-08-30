@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from coding_agent.checkpoints import CheckpointManager, FileChange, RestoreResult
 from coding_agent.context import (
     ContextBudgetError,
     ContextConfig,
@@ -18,6 +19,7 @@ from coding_agent.protocol import ChatClient, ModelClientError
 from coding_agent.sessions import (
     JsonSessionStore,
     SessionDocument,
+    WorkspaceEvent,
     adapt_messages_for_provider,
 )
 from coding_agent.tools import ToolRegistry
@@ -56,6 +58,8 @@ class AgentResult:
     steps: int
     tool_calls: int
     messages: list[dict[str, Any]]
+    checkpoint_id: str | None = None
+    changes: list[FileChange] = field(default_factory=list)
 
 
 class Agent:
@@ -70,6 +74,7 @@ class Agent:
         session_id: str | None = None,
         provider: str | None = None,
         model: str | None = None,
+        checkpoint_manager: CheckpointManager | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
@@ -89,7 +94,14 @@ class Agent:
         self.session_id = session_id
         self.provider = provider
         self.model = model
+        if (
+            checkpoint_manager is not None
+            and checkpoint_manager.workspace != self.workspace
+        ):
+            raise ValueError("checkpoint_manager belongs to a different workspace")
+        self.checkpoint_manager = checkpoint_manager
         self._session_document: SessionDocument | None = None
+        self._transient_workspace_events: list[WorkspaceEvent] = []
 
     def run(self, task: str) -> AgentResult:
         task = task.strip()
@@ -98,6 +110,12 @@ class Agent:
         if not self.workspace.is_dir():
             raise ValueError(f"Workspace is not a directory: {self.workspace}")
 
+        checkpoint = None
+        if self.checkpoint_manager is not None:
+            checkpoint = self.checkpoint_manager.create(
+                task,
+                session_id=self.session_id,
+            )
         history = self._prepare_history(task)
         tool_call_count = 0
 
@@ -130,11 +148,20 @@ class Agent:
 
             if turn.content and turn.content.strip():
                 self._save_history(history)
+                changes = (
+                    list(self.checkpoint_manager.diff(checkpoint.checkpoint_id).changes)
+                    if self.checkpoint_manager is not None and checkpoint is not None
+                    else []
+                )
                 return AgentResult(
                     final_answer=turn.content.strip(),
                     steps=step,
                     tool_calls=tool_call_count,
                     messages=history.messages,
+                    checkpoint_id=(
+                        checkpoint.checkpoint_id if checkpoint is not None else None
+                    ),
+                    changes=changes,
                 )
 
             raise AgentError(
@@ -179,15 +206,57 @@ class Agent:
         )
         self.session_store.save(self._session_document)
 
+    def record_workspace_restore(self, result: RestoreResult) -> None:
+        """Persist an Undo event without pretending it came from the model."""
+        if self.session_store is None or self.session_id is None:
+            self._transient_workspace_events.append(
+                WorkspaceEvent.checkpoint_restored(
+                    message_index=0,
+                    checkpoint_id=result.checkpoint_id,
+                    safety_checkpoint_id=result.safety_checkpoint_id,
+                    restored_files=result.restored_files,
+                    removed_files=result.removed_files,
+                )
+            )
+            return
+
+        document = self.session_store.load(self.session_id)
+        if document is None:
+            history = ConversationHistory()
+            history.append_system(SYSTEM_PROMPT)
+            document = SessionDocument.create(
+                session_id=self.session_id,
+                workspace=str(self.workspace),
+                provider=self.provider or "unknown",
+                model=self.model or "unknown",
+                messages=history.messages,
+            )
+        document = document.with_workspace_restore(
+            checkpoint_id=result.checkpoint_id,
+            safety_checkpoint_id=result.safety_checkpoint_id,
+            restored_files=result.restored_files,
+            removed_files=result.removed_files,
+        )
+        self.session_store.save(document)
+        self._session_document = document
+
     def _history_for_request(
         self,
         history: ConversationHistory,
     ) -> ConversationHistory:
         if self._session_document is None:
-            return history
-        messages = adapt_messages_for_provider(
-            history.messages,
-            self._session_document.provider_segments,
-            target_provider=self.provider or self._session_document.provider,
-        )
+            messages = history.messages
+            workspace_events = self._transient_workspace_events
+        else:
+            messages = adapt_messages_for_provider(
+                history.messages,
+                self._session_document.provider_segments,
+                target_provider=self.provider or self._session_document.provider,
+            )
+            workspace_events = list(self._session_document.workspace_events)
+        if workspace_events:
+            messages[0]["content"] += (
+                "\n\nTrusted local workspace event:\n- "
+                + workspace_events[-1].as_context_line()
+            )
         return ConversationHistory.from_messages(messages)

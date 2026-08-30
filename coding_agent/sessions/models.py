@@ -7,8 +7,8 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
-SESSION_FORMAT_VERSION = 2
-LEGACY_SESSION_FORMAT_VERSION = 1
+SESSION_FORMAT_VERSION = 3
+LEGACY_SESSION_FORMAT_VERSIONS = {1, 2}
 
 
 class SessionError(RuntimeError):
@@ -23,6 +23,18 @@ def _require_text(data: dict[str, Any], name: str) -> str:
     value = data.get(name)
     if not isinstance(value, str) or not value:
         raise SessionError(f"Session field {name!r} must be a non-empty string")
+    return value
+
+
+def _require_checkpoint_id(data: dict[str, Any], name: str) -> str:
+    value = _require_text(data, name)
+    if not value.startswith("cp-") or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        for character in value
+    ):
+        raise SessionError(
+            f"Session field {name!r} must be a valid checkpoint id"
+        )
     return value
 
 
@@ -56,6 +68,108 @@ class ProviderSegment:
 
     def to_dict(self) -> dict[str, Any]:
         return {"start_index": self.start_index, "provider": self.provider}
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceEvent:
+    """Trusted local event stored outside provider conversation messages."""
+
+    event_type: str
+    created_at: str
+    message_index: int
+    checkpoint_id: str
+    safety_checkpoint_id: str
+    restored_files: int
+    removed_files: int
+
+    @classmethod
+    def checkpoint_restored(
+        cls,
+        *,
+        message_index: int,
+        checkpoint_id: str,
+        safety_checkpoint_id: str,
+        restored_files: int,
+        removed_files: int,
+    ) -> WorkspaceEvent:
+        event = cls(
+            event_type="checkpoint_restored",
+            created_at=_utc_now(),
+            message_index=message_index,
+            checkpoint_id=checkpoint_id,
+            safety_checkpoint_id=safety_checkpoint_id,
+            restored_files=restored_files,
+            removed_files=removed_files,
+        )
+        return cls.from_dict(event.to_dict(), position=0)
+
+    @classmethod
+    def from_dict(cls, data: Any, *, position: int) -> WorkspaceEvent:
+        expected_fields = {
+            "event_type",
+            "created_at",
+            "message_index",
+            "checkpoint_id",
+            "safety_checkpoint_id",
+            "restored_files",
+            "removed_files",
+        }
+        if not isinstance(data, dict):
+            raise SessionError(f"Workspace event {position} must be an object")
+        if set(data) != expected_fields:
+            raise SessionError(f"Workspace event {position} has unsupported fields")
+        event_type = _require_text(data, "event_type")
+        if event_type != "checkpoint_restored":
+            raise SessionError(
+                f"Workspace event {position} has unsupported type: {event_type!r}"
+            )
+        created_at = _require_text(data, "created_at")
+        try:
+            datetime.fromisoformat(created_at)
+        except ValueError as exc:
+            raise SessionError(
+                f"Workspace event {position} created_at must be ISO-8601"
+            ) from exc
+        integer_fields: dict[str, int] = {}
+        for name in ("message_index", "restored_files", "removed_files"):
+            value = data.get(name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise SessionError(
+                    f"Workspace event {position} field {name!r} must be a "
+                    "non-negative integer"
+                )
+            integer_fields[name] = value
+        return cls(
+            event_type=event_type,
+            created_at=created_at,
+            message_index=integer_fields["message_index"],
+            checkpoint_id=_require_checkpoint_id(data, "checkpoint_id"),
+            safety_checkpoint_id=_require_checkpoint_id(
+                data,
+                "safety_checkpoint_id",
+            ),
+            restored_files=integer_fields["restored_files"],
+            removed_files=integer_fields["removed_files"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_type": self.event_type,
+            "created_at": self.created_at,
+            "message_index": self.message_index,
+            "checkpoint_id": self.checkpoint_id,
+            "safety_checkpoint_id": self.safety_checkpoint_id,
+            "restored_files": self.restored_files,
+            "removed_files": self.removed_files,
+        }
+
+    def as_context_line(self) -> str:
+        return (
+            f"{self.created_at}: the user restored workspace checkpoint "
+            f"{self.checkpoint_id} (restored_files={self.restored_files}, "
+            f"removed_files={self.removed_files}). Earlier discussion of file "
+            "contents may be stale; re-read relevant files before acting."
+        )
 
 
 def _validate_provider_segments(
@@ -97,6 +211,7 @@ class SessionDocument:
     updated_at: str
     messages: list[dict[str, Any]]
     provider_segments: tuple[ProviderSegment, ...]
+    workspace_events: tuple[WorkspaceEvent, ...]
     format_version: int = SESSION_FORMAT_VERSION
 
     @classmethod
@@ -119,6 +234,7 @@ class SessionDocument:
             updated_at=now,
             messages=deepcopy(messages),
             provider_segments=(ProviderSegment(0, provider),),
+            workspace_events=(),
         )
 
     @classmethod
@@ -126,11 +242,13 @@ class SessionDocument:
         if not isinstance(data, dict):
             raise SessionError("Session document must be a JSON object")
         version = data.get("format_version")
-        if version not in {LEGACY_SESSION_FORMAT_VERSION, SESSION_FORMAT_VERSION}:
+        supported_versions = LEGACY_SESSION_FORMAT_VERSIONS | {
+            SESSION_FORMAT_VERSION
+        }
+        if version not in supported_versions:
             raise SessionError(
                 "Unsupported session format version: "
-                f"{version!r}; expected {LEGACY_SESSION_FORMAT_VERSION} or "
-                f"{SESSION_FORMAT_VERSION}"
+                f"{version!r}; expected one of {sorted(supported_versions)}"
             )
         messages = data.get("messages")
         if not isinstance(messages, list):
@@ -147,7 +265,7 @@ class SessionDocument:
                 ) from exc
 
         provider = _require_text(data, "provider")
-        if version == LEGACY_SESSION_FORMAT_VERSION:
+        if version == 1:
             provider_segments = (ProviderSegment(0, provider),)
         else:
             raw_segments = data.get("provider_segments")
@@ -157,6 +275,26 @@ class SessionDocument:
                 ProviderSegment.from_dict(segment, position=position)
                 for position, segment in enumerate(raw_segments)
             )
+        if version < SESSION_FORMAT_VERSION:
+            workspace_events: tuple[WorkspaceEvent, ...] = ()
+        else:
+            raw_events = data.get("workspace_events")
+            if not isinstance(raw_events, list):
+                raise SessionError("Session field 'workspace_events' must be a list")
+            workspace_events = tuple(
+                WorkspaceEvent.from_dict(event, position=position)
+                for position, event in enumerate(raw_events)
+            )
+            if any(event.message_index > len(messages) for event in workspace_events):
+                raise SessionError(
+                    "Workspace event message_index exceeds session history"
+                )
+            if [event.message_index for event in workspace_events] != sorted(
+                event.message_index for event in workspace_events
+            ):
+                raise SessionError(
+                    "Workspace event message indexes must be non-decreasing"
+                )
         _validate_provider_segments(
             provider_segments,
             message_count=len(messages),
@@ -173,6 +311,7 @@ class SessionDocument:
             updated_at=updated_at,
             messages=deepcopy(messages),
             provider_segments=provider_segments,
+            workspace_events=workspace_events,
         )
 
     def with_messages(
@@ -208,6 +347,27 @@ class SessionDocument:
             provider_segments=provider_segments,
         )
 
+    def with_workspace_restore(
+        self,
+        *,
+        checkpoint_id: str,
+        safety_checkpoint_id: str,
+        restored_files: int,
+        removed_files: int,
+    ) -> SessionDocument:
+        event = WorkspaceEvent.checkpoint_restored(
+            message_index=len(self.messages),
+            checkpoint_id=checkpoint_id,
+            safety_checkpoint_id=safety_checkpoint_id,
+            restored_files=restored_files,
+            removed_files=removed_files,
+        )
+        return replace(
+            self,
+            updated_at=event.created_at,
+            workspace_events=self.workspace_events + (event,),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "format_version": self.format_version,
@@ -220,5 +380,8 @@ class SessionDocument:
             "messages": deepcopy(self.messages),
             "provider_segments": [
                 segment.to_dict() for segment in self.provider_segments
+            ],
+            "workspace_events": [
+                event.to_dict() for event in self.workspace_events
             ],
         }

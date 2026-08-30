@@ -3,6 +3,7 @@ import json
 import pytest
 
 from coding_agent.agent import Agent
+from coding_agent.checkpoints import RestoreResult
 from coding_agent.context import ConversationHistory
 from coding_agent.protocol import ModelTurn
 from coding_agent.sessions import (
@@ -60,6 +61,7 @@ def test_version_one_session_is_migrated_without_changing_messages(tmp_path):
     legacy_data = original.to_dict()
     legacy_data["format_version"] = 1
     legacy_data.pop("provider_segments")
+    legacy_data.pop("workspace_events")
     path = store.session_path("1")
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(legacy_data), encoding="utf-8")
@@ -67,16 +69,34 @@ def test_version_one_session_is_migrated_without_changing_messages(tmp_path):
     loaded = store.load("1")
 
     assert loaded is not None
-    assert loaded.format_version == 2
+    assert loaded.format_version == 3
     assert loaded.messages == original.messages
     assert loaded.provider_segments == (ProviderSegment(0, "deepseek"),)
     store.save(loaded)
     saved_data = json.loads(path.read_text(encoding="utf-8"))
-    assert saved_data["format_version"] == 2
+    assert saved_data["format_version"] == 3
     assert saved_data["messages"] == legacy_data["messages"]
     assert saved_data["provider_segments"] == [
         {"start_index": 0, "provider": "deepseek"}
     ]
+    assert saved_data["workspace_events"] == []
+
+
+def test_version_two_session_is_migrated_with_empty_workspace_events(tmp_path):
+    store = JsonSessionStore(tmp_path)
+    data = _document(store, _completed_history()).to_dict()
+    data["format_version"] = 2
+    data.pop("workspace_events")
+    path = store.session_path("version-two")
+    data["session_id"] = "version-two"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    loaded = store.load("version-two")
+
+    assert loaded is not None
+    assert loaded.format_version == 3
+    assert loaded.workspace_events == ()
 
 
 def test_provider_adapter_removes_only_foreign_reasoning_without_mutation():
@@ -281,6 +301,58 @@ def test_agent_switches_provider_using_a_converted_request_copy(tmp_path):
     ]
     assert assistant_messages[0]["reasoning_content"] == "deepseek reasoning"
     assert assistant_messages[1]["reasoning_content"] == "qianwen reasoning"
+
+
+def test_workspace_restore_event_is_persisted_and_injected_into_request(tmp_path):
+    store = JsonSessionStore(tmp_path)
+    first = Agent(
+        FinalAnswerClient("first task", "first answer"),
+        tmp_path,
+        session_store=store,
+        session_id="restore-event",
+        provider="deepseek",
+        model="test-model",
+    )
+    first.run("first task")
+    first.record_workspace_restore(
+        RestoreResult(
+            checkpoint_id="cp-original",
+            safety_checkpoint_id="cp-safety",
+            restored_files=2,
+            removed_files=1,
+        )
+    )
+
+    after_event = store.load("restore-event")
+    assert after_event is not None
+    assert len(after_event.workspace_events) == 1
+    assert after_event.workspace_events[0].checkpoint_id == "cp-original"
+    assert "Trusted local workspace event" not in after_event.messages[0]["content"]
+
+    def inspect_request(messages):
+        system_content = messages[0]["content"]
+        assert "Trusted local workspace event" in system_content
+        assert "cp-original" in system_content
+        assert "re-read relevant files" in system_content
+
+    second = Agent(
+        ReasoningAnswerClient(
+            "second answer",
+            "second reasoning",
+            inspect_request=inspect_request,
+        ),
+        tmp_path,
+        session_store=JsonSessionStore(tmp_path),
+        session_id="restore-event",
+        provider="deepseek",
+        model="test-model",
+    )
+    second.run("second task")
+
+    reloaded = store.load("restore-event")
+    assert reloaded is not None
+    assert len(reloaded.workspace_events) == 1
+    assert "Trusted local workspace event" not in reloaded.messages[0]["content"]
 
 
 def test_model_tools_cannot_access_session_state(tmp_path):

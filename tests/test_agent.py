@@ -4,6 +4,7 @@ import sys
 import pytest
 
 from coding_agent.agent import Agent, AgentError
+from coding_agent.checkpoints import CheckpointManager
 from coding_agent.context import ContextConfig
 from coding_agent.protocol import ModelClientError, ModelTurn, ToolCall
 
@@ -261,6 +262,25 @@ def test_agent_can_write_and_read_back_a_file(tmp_path):
     assert (tmp_path / "hello.py").read_text(encoding="utf-8") == (
         "print('Hello, Agent!')\n"
     )
+
+
+def test_agent_checkpoint_captures_and_can_undo_tool_changes(tmp_path):
+    checkpoint_manager = CheckpointManager(tmp_path)
+    agent = Agent(
+        WriteThenReadClient(),
+        tmp_path,
+        max_steps=5,
+        checkpoint_manager=checkpoint_manager,
+    )
+
+    result = agent.run("Create hello.py and verify its contents.")
+
+    assert result.checkpoint_id is not None
+    assert [(change.status, change.path) for change in result.changes] == [
+        ("added", "hello.py")
+    ]
+    checkpoint_manager.restore(result.checkpoint_id)
+    assert not (tmp_path / "hello.py").exists()
 
 
 def test_agent_can_write_and_execute_a_program(tmp_path):

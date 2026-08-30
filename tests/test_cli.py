@@ -1,6 +1,7 @@
 from typer.testing import CliRunner
 
 from coding_agent.agent import AgentError, AgentResult
+from coding_agent.checkpoints import CheckpointManager
 from coding_agent.cli import Provider, app, create_client
 from coding_agent.llm_client import DeepSeekClient, QianwenClient
 
@@ -126,3 +127,38 @@ def test_interactive_mode_reports_task_error_and_accepts_next_question(
     assert result.exit_code == 0
     assert "Error: temporary failure" in result.output
     assert "recovered" in result.output
+
+
+def test_interactive_diff_and_undo_commands_restore_workspace(tmp_path, monkeypatch):
+    target = tmp_path / "code.py"
+    target.write_text("before\n", encoding="utf-8")
+    checkpoint = CheckpointManager(tmp_path).create("before edit")
+    target.write_text("after\n", encoding="utf-8")
+
+    class UnusedAgent:
+        def __init__(self, *args, **kwargs):
+            self.restore_events = []
+
+        def run(self, task):
+            raise AssertionError("Slash commands must not be sent to the model")
+
+        def record_workspace_restore(self, result):
+            self.restore_events.append(result)
+
+    monkeypatch.setattr(
+        "coding_agent.cli.create_client",
+        lambda provider: (object(), "test-model"),
+    )
+    monkeypatch.setattr("coding_agent.cli.Agent", UnusedAgent)
+
+    result = runner.invoke(
+        app,
+        ["run", "--workspace", str(tmp_path)],
+        input=f"/diff {checkpoint.checkpoint_id}\n/undo {checkpoint.checkpoint_id}\ny\nquit\n",
+    )
+
+    assert result.exit_code == 0
+    assert "M code.py" in result.output
+    assert f"Restored {checkpoint.checkpoint_id}" in result.output
+    assert "Workspace restore event recorded" in result.output
+    assert target.read_text(encoding="utf-8") == "before\n"

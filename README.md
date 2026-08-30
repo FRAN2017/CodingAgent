@@ -15,6 +15,7 @@ AutoGen、CrewAI，也不允许包装 Claude Code、Codex、OpenCode 等现成 A
 - 自主管理完整对话历史、输入预算和确定性上下文压缩，不依赖 LangChain Memory 等现成记忆模块；
 - 将工具调用和对应工具结果作为原子块保留，避免压缩后形成无效消息序列；
 - 通过工作区内的版本化 JSON 文件保存原始完整会话，恢复时可切换 DeepSeek 与 Qianwen；
+- 每次任务前自动创建内容寻址的工作区检查点，支持 `/diff`、`/undo` 和 `/checkpoints`；
 - 通过 `read_file` 分段读取工作区内的 UTF-8 文本文件；
 - 通过 `list_files` 递归发现工作区内的文件和目录；
 - 通过 `search_text` 在陌生仓库中定位代码、配置和符号；
@@ -38,6 +39,12 @@ coding-agent/
 │   ├── agent.py
 │   ├── cli.py
 │   ├── config.py
+│   ├── checkpoints/
+│   │   ├── __init__.py
+│   │   ├── manager.py
+│   │   ├── models.py
+│   │   ├── scanner.py
+│   │   └── store.py
 │   ├── context/
 │   │   ├── __init__.py
 │   │   ├── config.py
@@ -64,6 +71,7 @@ coding-agent/
 │       └── workspace.py
 ├── tests/
 │   ├── test_agent.py
+│   ├── test_checkpoints.py
 │   ├── test_config.py
 │   ├── test_context.py
 │   ├── test_cli.py
@@ -102,18 +110,19 @@ coding-agent/
 实现项目的核心 Agent Loop，主要职责包括：
 
 1. 创建一次性历史，或根据会话 ID 恢复已有完整历史并追加用户任务；
-2. 在每次模型请求前根据上下文预算生成请求视图；
-3. 判断模型返回的是工具调用还是最终答案；
-4. 将工具调用交给 `ToolRegistry` 执行；
-5. 把工具调用与工具结果作为完整原子块加入对话历史；
-6. 在完整工具交互和最终回答产生后原子保存持久会话；
-7. 持续循环，直到模型生成最终答案；
-8. 达到最大步数或收到异常响应时安全终止。
+2. 在任务执行前创建工作区检查点；
+3. 在每次模型请求前根据上下文预算生成请求视图；
+4. 判断模型返回的是工具调用还是最终答案；
+5. 将工具调用交给 `ToolRegistry` 执行；
+6. 把工具调用与工具结果作为完整原子块加入对话历史；
+7. 在完整工具交互和最终回答产生后原子保存持久会话；
+8. 完成后计算相对检查点的文件变化并返回；
+9. 达到最大步数或收到异常响应时安全终止。
 
 该文件还定义：
 
 - `SYSTEM_PROMPT`：约束模型必须使用工具读取工作区，不得虚构工具结果；
-- `AgentResult`：保存最终答案、模型轮次、工具调用次数和未经压缩的完整消息历史；
+- `AgentResult`：保存最终答案、模型轮次、工具调用次数、完整消息历史、检查点 ID 和文件变化；
 - `AgentError`：表示 Agent 无法安全完成任务。
 
 #### `coding_agent/cli.py`
@@ -128,6 +137,7 @@ coding-agent/
 - 兼容旧的 `--model` 或 `-m` 参数别名；
 - 使用 `--session` 或 `-s` 创建或恢复工作区内的 JSON 会话；
 - 支持用 `quit`、`exit`、`q` 或 `退出` 结束交互模式；
+- 支持 `/diff [id]`、`/undo [id]` 和 `/checkpoints` 本地命令；
 - 展示提供商、模型名称、工作区、最终答案和运行统计；
 - 将配置、模型 API、Agent、会话、文件错误和用户中断转换为清晰的终端提示。
 
@@ -140,6 +150,25 @@ coding-agent/
 - 请求超时默认每次尝试 180 秒，可配置为 1～3,600 秒；SDK 重试默认 2 次，可配置为 0～10 次。
 
 如果对应的 API Key 未设置，程序会抛出 `ConfigurationError`，不会在代码中使用默认密钥。
+
+#### `coding_agent/checkpoints/`
+
+实现不依赖 Git 的第一版工作区检查点：
+
+- `models.py`：定义版本化 manifest、文件记录、变更集合、恢复结果和 `CheckpointError`；
+- `scanner.py`：稳定扫描普通文件，排除受保护目录，拒绝符号链接并计算 SHA-256；
+- `store.py`：将文件原始字节按 SHA-256 去重保存，并原子写入检查点 manifest；
+- `manager.py`：创建和列出检查点，识别新增、修改、删除及重命名，生成 Unified Diff，并安全恢复；
+- `__init__.py`：提供检查点包的稳定公开接口。
+
+检查点保存在 `<workspace>/.coding-agent/checkpoints/`，模型工具无法读取。任务开始前保存完整
+允许范围，因此 `run_command` 在工作区内产生的文件变化也能被发现和撤销。Undo 前会创建
+`pre_undo` 安全检查点，恢复完成后重新扫描并验证哈希。
+
+第一版最多扫描 20,000 个文件，单文件最大 32 MiB，总快照最大 256 MiB；超过限制或遇到
+非忽略路径中的符号链接时拒绝执行没有完整 Undo 保护的任务。`.env`、`.git`、`.coding-agent`、
+虚拟环境、依赖、缓存和构建目录不进入检查点，因此 Undo 不会改写这些状态。当前版本尚未实现
+并发恢复锁和自动清理旧检查点，检查点也可能包含项目源码，不应提交 `.coding-agent`。
 
 #### `coding_agent/context/`
 
@@ -160,7 +189,7 @@ coding-agent/
 
 实现不依赖数据库的完整会话持久化：
 
-- `models.py`：定义版本化 `SessionDocument`、提供商历史分段、完整消息列表和 `SessionError`；
+- `models.py`：定义版本化 `SessionDocument`、提供商分段、工作区事件、完整消息和 `SessionError`；
 - `adapter.py`：根据目标提供商生成请求副本，移除其他提供商专属的 `reasoning_content`；
 - `store.py`：校验会话 ID，加载并验证 JSON，通过同目录临时文件、`fsync` 和 `os.replace` 原子保存；
 - `__init__.py`：提供会话包的稳定公开接口。
@@ -330,7 +359,9 @@ system、user、assistant、tool 和 tool_calls 消息，而不是压缩后的�
 - 模型能够完成 `write_file → run_command → 根据输出结束` 的执行闭环。
 - 模型能够调用 `rename_file` 重命名文件，并根据工具成功结果结束任务；
 - 模型能够调用 `apply_patch` 完成局部修改；
-- 超出上下文预算时，请求会压缩旧事件，同时 `AgentResult.messages` 保留完整历史。
+- 超出上下文预算时，请求会压缩旧事件，同时 `AgentResult.messages` 保留完整历史；
+- Agent 执行工具前创建检查点，并在完成后返回变更列表；
+- 检查点能够撤销 Agent 工具产生的新文件。
 
 #### `tests/test_config.py`
 
@@ -353,7 +384,12 @@ system、user、assistant、tool 和 tool_calls 消息，而不是压缩后的�
 #### `tests/test_cli.py`
 
 测试命令行客户端工厂能够根据提供商分别构造 DeepSeek 与 Qianwen 客户端，并验证单次错误输出、
-交互循环、Agent 复用、退出命令和任务失败后的继续提问。
+交互循环、Agent 复用、退出命令、检查点斜杠命令和任务失败后的继续提问。
+
+#### `tests/test_checkpoints.py`
+
+测试工作区检查点，包括新增、修改、删除和重命名检测、Unified Diff、完整恢复、Undo 前安全
+检查点、受保护状态排除、损坏对象拒绝恢复和符号链接拒绝。
 
 #### `tests/test_llm_client.py`
 
@@ -375,6 +411,7 @@ system、user、assistant、tool 和 tool_calls 消息，而不是压缩后的�
 - 会话 ID 路径安全、格式版本、损坏 JSON 和工作区绑定校验；
 - 原子替换失败时保留原会话文件；
 - 两次独立 Agent 运行使用同一 ID 恢复历史；
+- Undo 工作区事件独立持久化，并在请求副本中提示模型重新读取文件；
 - 模型文件工具无法读取、写入或发现 `.coding-agent` 会话状态。
 
 #### `tests/test_tools.py`
@@ -502,12 +539,27 @@ Completed
 ...
 Completed
 
+>> /diff
+Changes since cp-...:
+  M coding_agent/agent.py
+
+>> /undo
+Restore cp-...? [y/N] y
+Restored cp-...
+
 >> quit
 会话已结束。
 ```
 
 这里的 `-Session 1` 会让每个问题共享并持久化完整对话历史；关闭程序后，再用相同工作区和
 Session ID 启动仍可继续原会话。不传 `-Session` 也能交互，但每个问题的历史彼此独立。
+
+每个普通任务开始前都会自动创建检查点。`/diff [checkpoint-id]` 查看差异，
+`/undo [checkpoint-id]` 在确认后恢复，`/checkpoints` 列出最近的检查点。省略 ID 时使用当前进程
+最近的检查点；重启后使用工作区中创建时间最新的检查点。Undo 只恢复工作区文件，不删除
+原始对话消息，并会先建立 `pre_undo` 安全检查点。恢复成功后自动向当前会话的
+`workspace_events` 写入本地事件；下一次请求会收到“文件内容可能过期，必须重新读取”的提示。
+未使用 `-Session` 时事件只保存在当前交互进程内，退出后不持久化。
 
 只检查 `.env` 是否能够正确加载（不会显示密钥）：
 
@@ -655,8 +707,9 @@ examples/demo/.coding-agent/sessions/session-calculator.json
 同一会话可以从 DeepSeek 切换到 Qianwen，也可以再切换回来。JSON 中的 assistant 原始消息
 （包括 `reasoning_content`）始终原样保存，同时用 `provider_segments` 记录各段消息的来源。
 真正请求模型时才创建深拷贝：目标提供商自己的推理字段保持不变，其他提供商产生的
-`reasoning_content` 会从请求副本中移除。转换和上下文压缩都不会反写原始会话历史。旧版
-`format_version: 1` 会话会在内存中迁移，并在下一次保存时写成版本 2。
+`reasoning_content` 会从请求副本中移除。转换和上下文压缩都不会反写原始会话历史。
+`workspace_events` 独立保存 Undo 等可信本地事件，并只在构建模型请求时追加到临时系统提示。
+旧版 `format_version: 1` 和版本 2 会话会在内存中迁移，并在下一次保存时写成版本 3。
 
 `.coding-agent` 已加入 Git 和模型工具忽略规则。会话文件可能包含读取过的代码片段和命令输出，
 不应提交到仓库。当前第一版不支持并发写入同一会话；工具执行产生副作用后、会话保存前若进程

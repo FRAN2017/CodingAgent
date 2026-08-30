@@ -10,6 +10,12 @@ import typer
 from rich.console import Console
 
 from coding_agent.agent import Agent, AgentError, AgentResult
+from coding_agent.checkpoints import (
+    ChangeSet,
+    CheckpointError,
+    CheckpointManager,
+    RestoreResult,
+)
 from coding_agent.config import ConfigurationError, DeepseekConfig, QianwenConfig
 from coding_agent.context import ContextConfig
 from coding_agent.llm_client import DeepSeekClient, QianwenClient
@@ -101,6 +107,7 @@ def run(
         session_store = (
             JsonSessionStore(resolved_workspace) if session is not None else None
         )
+        checkpoint_manager = CheckpointManager(resolved_workspace)
         agent = Agent(
             client,
             resolved_workspace,
@@ -110,6 +117,7 @@ def run(
             session_id=session,
             provider=provider.value if session is not None else None,
             model=model_name if session is not None else None,
+            checkpoint_manager=checkpoint_manager,
         )
 
         console.print(
@@ -121,7 +129,11 @@ def run(
         )
 
         if task is None:
-            _run_interactive(agent, persistent=session is not None)
+            _run_interactive(
+                agent,
+                checkpoint_manager,
+                persistent=session is not None,
+            )
             return
 
         result = agent.run(task)
@@ -129,6 +141,7 @@ def run(
     except (
         ConfigurationError,
         AgentError,
+        CheckpointError,
         SessionError,
         OSError,
         ValueError,
@@ -143,11 +156,19 @@ def run(
     _print_result(result)
 
 
-def _run_interactive(agent: Agent, *, persistent: bool) -> None:
+def _run_interactive(
+    agent: Agent,
+    checkpoint_manager: CheckpointManager,
+    *,
+    persistent: bool,
+) -> None:
     console.print(
         "[bold green]Interactive mode[/bold green]  "
         "输入编程任务，输入 [bold]quit[/bold]、[bold]exit[/bold] 或"
         " [bold]退出[/bold] 结束。"
+    )
+    console.print(
+        "[dim]Checkpoint commands: /diff, /undo, /checkpoints[/dim]"
     )
     if not persistent:
         console.print(
@@ -166,10 +187,22 @@ def _run_interactive(agent: Agent, *, persistent: bool) -> None:
             return
         if not task:
             continue
+        if task.startswith("/"):
+            try:
+                _handle_checkpoint_command(task, checkpoint_manager, agent)
+            except (CheckpointError, OSError, ValueError) as exc:
+                console.print(f"[bold red]Error:[/bold red] {exc}")
+            continue
 
         try:
             result = agent.run(task)
-        except (AgentError, SessionError, OSError, ValueError) as exc:
+        except (
+            AgentError,
+            CheckpointError,
+            SessionError,
+            OSError,
+            ValueError,
+        ) as exc:
             console.print(f"[bold red]Error:[/bold red] {exc}")
             continue
 
@@ -181,6 +214,97 @@ def _print_result(result: AgentResult) -> None:
     console.print(result.final_answer)
     console.print(
         f"\n[dim]steps={result.steps} tool_calls={result.tool_calls}[/dim]"
+    )
+    if result.checkpoint_id is not None:
+        console.print(
+            f"[dim]checkpoint={result.checkpoint_id} "
+            f"changed_files={len(result.changes)}[/dim]"
+        )
+
+
+def _handle_checkpoint_command(
+    command: str,
+    checkpoint_manager: CheckpointManager,
+    agent: Agent,
+) -> None:
+    parts = command.split()
+    name = parts[0].casefold()
+    if len(parts) > 2:
+        raise ValueError(f"Too many arguments for {parts[0]}")
+    checkpoint_id = parts[1] if len(parts) == 2 else None
+
+    if name == "/diff":
+        _print_changes(checkpoint_manager.diff(checkpoint_id))
+        return
+    if name == "/checkpoints":
+        if checkpoint_id is not None:
+            raise ValueError("/checkpoints does not accept an id")
+        checkpoints = checkpoint_manager.list()
+        if not checkpoints:
+            console.print("[yellow]No checkpoints are available.[/yellow]")
+            return
+        for checkpoint in checkpoints[:20]:
+            console.print(
+                f"[cyan]{checkpoint.checkpoint_id}[/cyan]  "
+                f"{checkpoint.kind}  {checkpoint.created_at}  "
+                f"{checkpoint.task}"
+            )
+        return
+    if name == "/undo":
+        target = (
+            checkpoint_manager.get(checkpoint_id)
+            if checkpoint_id is not None
+            else checkpoint_manager.latest()
+        )
+        changes = checkpoint_manager.diff(target.checkpoint_id)
+        _print_changes(changes)
+        answer = console.input(
+            f"[yellow]Restore {target.checkpoint_id}? [y/N][/yellow] "
+        ).strip()
+        if answer.casefold() not in {"y", "yes"}:
+            console.print("[yellow]Undo cancelled.[/yellow]")
+            return
+        result = checkpoint_manager.restore(target.checkpoint_id)
+        _print_restore(result)
+        agent.record_workspace_restore(result)
+        console.print("[dim]Workspace restore event recorded.[/dim]")
+        return
+    raise ValueError(
+        "Unknown command. Available commands: /diff, /undo, /checkpoints"
+    )
+
+
+def _print_changes(change_set: ChangeSet) -> None:
+    if not change_set.changes:
+        console.print(
+            f"[green]No changes since {change_set.checkpoint_id}.[/green]"
+        )
+        return
+    labels = {
+        "added": "A",
+        "modified": "M",
+        "deleted": "D",
+        "renamed": "R",
+    }
+    console.print(f"[bold]Changes since {change_set.checkpoint_id}:[/bold]")
+    for change in change_set.changes:
+        if change.status == "renamed":
+            console.print(f"  R {change.old_path} -> {change.path}")
+        else:
+            console.print(f"  {labels[change.status]} {change.path}")
+        if change.patch:
+            console.print(change.patch, markup=False, highlight=False)
+
+
+def _print_restore(result: RestoreResult) -> None:
+    console.print(
+        f"[bold green]Restored {result.checkpoint_id}[/bold green]  "
+        f"restored_files={result.restored_files}  "
+        f"removed_files={result.removed_files}"
+    )
+    console.print(
+        f"[dim]Safety checkpoint: {result.safety_checkpoint_id}. "
+        "Conversation messages were retained.[/dim]"
     )
 
 
