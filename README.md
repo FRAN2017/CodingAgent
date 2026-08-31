@@ -12,6 +12,8 @@ AutoGen、CrewAI，也不允许包装 Claude Code、Codex、OpenCode 等现成 A
 - 调用 OpenAI 兼容的 Chat Completions API，支持 DeepSeek 与 Qianwen 双提供商；
 - 解析模型原生 Tool Calling 响应；
 - 自主管理“模型 → 工具 → 模型”的 Agent Loop；
+- 支持默认 `react` 与可选 `plan-execute` 两种编排模式；
+- Plan-and-Execute 会先生成 2～6 步线性计划，再逐步执行并由本地代码核验工具证据；
 - 自主管理完整对话历史、输入预算和确定性上下文压缩，不依赖 LangChain Memory 等现成记忆模块；
 - 将工具调用和对应工具结果作为原子块保留，避免压缩后形成无效消息序列；
 - 通过工作区内的版本化 JSON 文件保存原始完整会话，恢复时可切换 DeepSeek 与 Qianwen；
@@ -53,6 +55,12 @@ coding-agent/
 │   │   ├── summary.py
 │   │   └── token_counter.py
 │   ├── llm_client.py
+│   ├── planning/
+│   │   ├── __init__.py
+│   │   ├── agent.py
+│   │   ├── models.py
+│   │   ├── schemas.py
+│   │   └── store.py
 │   ├── protocol.py
 │   ├── sessions/
 │   │   ├── __init__.py
@@ -77,6 +85,7 @@ coding-agent/
 │   ├── test_cli.py
 │   ├── test_llm_client.py
 │   ├── test_patch.py
+│   ├── test_planning.py
 │   ├── test_rename.py
 │   ├── test_search.py
 │   ├── test_sessions.py
@@ -136,6 +145,7 @@ coding-agent/
 - 使用 `--provider` 或 `-p` 选择模型提供商（`deepseek` 或 `qianwen`）；
 - 兼容旧的 `--model` 或 `-m` 参数别名；
 - 使用 `--session` 或 `-s` 创建或恢复工作区内的 JSON 会话；
+- 使用 `--agent-mode` 或 `-a` 选择 `react`（默认）或 `plan-execute`；
 - 支持用 `quit`、`exit`、`q` 或 `退出` 结束交互模式；
 - 支持 `/diff [id]`、`/undo [id]` 和 `/checkpoints` 本地命令；
 - 展示提供商、模型名称、工作区、最终答案和运行统计；
@@ -184,6 +194,30 @@ coding-agent/
 这里刻意区分两份数据：`ConversationHistory` 始终保存当前会话的完整审计历史，
 `ContextManager` 只为单次模型请求构建受预算约束的临时视图，因此压缩不会破坏原始记录。
 摘要被明确标记为不可信数据；模型需要精确内容时仍应重新读取文件。
+
+#### `coding_agent/planning/`
+
+实现不依赖 Agent 框架的第一版 Plan-and-Execute 编排：
+
+- `models.py`：定义版本化 `TaskPlan`、`PlanStep`、计划/步骤状态和 `PlanError`；
+- `schemas.py`：定义控制器专用的 `submit_plan` 与 `finish_step` Tool Calling Schema；
+- `store.py`：将计划原子保存到 `<workspace>/.coding-agent/plans/plan-<id>.json`；
+- `agent.py`：实现只读规划、逐步执行、本地证据核验、最多一次重新规划和最终总结；
+- `__init__.py`：提供规划包的稳定公开接口。
+
+规划阶段只开放 `read_file`、`list_files` 和 `search_text`，模型必须通过 `submit_plan` 提交
+2～6 步线性计划。执行阶段每次只处理一个步骤，并通过 `finish_step` 申请完成；本地控制器要求
+至少一个成功工具结果，测试类步骤还必须有 `run_command exit_code=0`，修改类步骤必须有成功的
+`write_file`、`apply_patch` 或 `rename_file` 结果。规划、执行、重新规划和最终回答共同使用
+`--max-steps` 总模型轮次，整个任务只创建一个工作区检查点。
+
+规划阶段最多使用 6 个模型轮次。模型完成一次只读探索后，后续请求会明确列出已经使用过的
+探索工具并要求避免重复检查；最后一个规划轮次关闭工作区探索，只向模型提供 `submit_plan`，
+强制规划流程从“继续观察”转换到“提交结构化计划”。如果仍未提交，错误信息会列出每轮实际
+调用的工具，例如 `turn 1=[list_files]; turn 2=[search_text]`，便于定位模型能力或提示遵循问题。
+
+第一版不支持并行步骤、DAG 依赖、人工编辑计划和跨进程继续执行未完成计划；单个步骤最多使用
+5 次模型调用，失败时最多自动重新规划一次。计划 JSON 用于观察和审计，不会自动恢复中断执行。
 
 #### `coding_agent/sessions/`
 
@@ -414,6 +448,12 @@ system、user、assistant、tool 和 tool_calls 消息，而不是压缩后的�
 - Undo 工作区事件独立持久化，并在请求副本中提示模型重新读取文件；
 - 模型文件工具无法读取、写入或发现 `.coding-agent` 会话状态。
 
+#### `tests/test_planning.py`
+
+使用确定性的 Fake Client 测试 Plan-and-Execute 完整闭环，包括计划提交、分步执行、文件写入、
+命令验证、`finish_step` 本地证据核验、计划 JSON 往返保存、单任务单检查点、连续只读探索后的
+最终强制提交、失败工具轨迹诊断和最终结果汇总。
+
 #### `tests/test_tools.py`
 
 测试 `read_file`、`list_files`、`write_file`、`run_command` 和工具注册器，包括：
@@ -492,6 +532,7 @@ system、user、assistant、tool 和 tool_calls 消息，而不是压缩后的�
 
 PowerShell 启动脚本。自动读取 `.env`，根据 `-Provider` 校验对应 API Key，优先使用项目
 `.venv` 中的 Python，并把可选任务、工作区、最大轮次、提供商和会话 ID 传递给 `coding_agent`。
+可通过 `-AgentMode react` 或 `-AgentMode plan-execute` 选择编排模式。
 省略任务时直接进入持续交互模式。
 `-CheckConfig` 模式只验证配置，不调用模型或显示密钥。
 
@@ -583,6 +624,31 @@ Session ID 启动仍可继续原会话。不传 `-Session` 也能交互，但每
   -Workspace . `
   -MaxSteps 20
 ```
+
+使用 Plan-and-Execute 模式：
+
+```powershell
+.\run-agent.ps1 `
+  "分析项目结构，修复失败测试并重新验证" `
+  -Workspace . `
+  -MaxSteps 20 `
+  -AgentMode plan-execute `
+  -Session repair-demo
+```
+
+也可以直接使用模块入口：
+
+```powershell
+python -m coding_agent run `
+  "分析项目结构，修复失败测试并重新验证" `
+  --workspace . `
+  --max-steps 20 `
+  --agent-mode plan-execute
+```
+
+默认值仍是 `react`，因此原有命令无需修改。Plan-and-Execute 至少需要 6 次模型轮次，实际编程
+任务建议设置为 15～30。完成后终端会额外输出 `plan=plan-...`，对应计划保存在工作区的
+`.coding-agent/plans/` 下；该目录受工具访问和 Git 忽略规则保护。
 
 如果不使用启动脚本，也可以在 PowerShell 中手动加载 `.env`：
 

@@ -19,6 +19,7 @@ from coding_agent.checkpoints import (
 from coding_agent.config import ConfigurationError, DeepseekConfig, QianwenConfig
 from coding_agent.context import ContextConfig
 from coding_agent.llm_client import DeepSeekClient, QianwenClient
+from coding_agent.planning import PlanError, PlanExecuteAgent
 from coding_agent.protocol import ChatClient
 from coding_agent.sessions import JsonSessionStore, SessionError
 
@@ -35,6 +36,11 @@ EXIT_COMMANDS = {"quit", "exit", "q", "退出"}
 class Provider(str, Enum):
     deepseek = "deepseek"
     qianwen = "qianwen"
+
+
+class AgentMode(str, Enum):
+    react = "react"
+    plan_execute = "plan-execute"
 
 
 def create_client(provider: Provider) -> tuple[ChatClient, str]:
@@ -96,6 +102,14 @@ def run(
             help="Create or resume a JSON session in the workspace",
         ),
     ] = None,
+    agent_mode: Annotated[
+        AgentMode,
+        typer.Option(
+            "--agent-mode",
+            "-a",
+            help="Choose react or plan-execute orchestration",
+        ),
+    ] = AgentMode.react,
 ) -> None:
     """Run one task or start an interactive coding-agent session."""
     try:
@@ -108,7 +122,8 @@ def run(
             JsonSessionStore(resolved_workspace) if session is not None else None
         )
         checkpoint_manager = CheckpointManager(resolved_workspace)
-        agent = Agent(
+        agent_class = Agent if agent_mode == AgentMode.react else PlanExecuteAgent
+        agent = agent_class(
             client,
             resolved_workspace,
             max_steps=max_steps,
@@ -124,6 +139,7 @@ def run(
             f"[bold cyan]coding-agent[/bold cyan]  "
             f"provider={provider.value}  "
             f"model={model_name}  "
+            f"mode={agent_mode.value}  "
             f"workspace={resolved_workspace}"
             + (f"  session={session}" if session is not None else "")
         )
@@ -142,6 +158,7 @@ def run(
         ConfigurationError,
         AgentError,
         CheckpointError,
+        PlanError,
         SessionError,
         OSError,
         ValueError,
@@ -199,6 +216,7 @@ def _run_interactive(
         except (
             AgentError,
             CheckpointError,
+            PlanError,
             SessionError,
             OSError,
             ValueError,
@@ -220,6 +238,8 @@ def _print_result(result: AgentResult) -> None:
             f"[dim]checkpoint={result.checkpoint_id} "
             f"changed_files={len(result.changes)}[/dim]"
         )
+    if result.plan_id is not None:
+        console.print(f"[dim]plan={result.plan_id}[/dim]")
 
 
 def _handle_checkpoint_command(

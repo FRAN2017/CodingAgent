@@ -11,6 +11,9 @@ param(
     [ValidateSet("deepseek", "qianwen")]
     [string]$Provider = "deepseek",
 
+    [ValidateSet("react", "plan-execute")]
+    [string]$AgentMode = "react",
+
     [string]$Session,
 
     [string]$EnvFile = (Join-Path $PSScriptRoot ".env"),
@@ -112,7 +115,9 @@ $agentArguments += @(
     "--max-steps",
     $MaxSteps,
     "--provider",
-    $Provider
+    $Provider,
+    "--agent-mode",
+    $AgentMode
 )
 if (-not [string]::IsNullOrWhiteSpace($Session)) {
     $agentArguments += @("--session", $Session)

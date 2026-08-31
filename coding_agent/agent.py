@@ -60,6 +60,7 @@ class AgentResult:
     messages: list[dict[str, Any]]
     checkpoint_id: str | None = None
     changes: list[FileChange] = field(default_factory=list)
+    plan_id: str | None = None
 
 
 class Agent:
@@ -120,14 +121,7 @@ class Agent:
         tool_call_count = 0
 
         for step in range(1, self.max_steps + 1):
-            try:
-                request_history = self._history_for_request(history)
-                request_messages = self.context_manager.build_request(
-                    request_history,
-                    self.tools.schemas,
-                )
-            except ContextBudgetError as exc:
-                raise AgentError(f"Cannot build model context: {exc}") from exc
+            request_messages = self._build_request(history, self.tools.schemas)
 
             try:
                 turn = self.client.complete(request_messages, self.tools.schemas)
@@ -260,3 +254,21 @@ class Agent:
                 + workspace_events[-1].as_context_line()
             )
         return ConversationHistory.from_messages(messages)
+
+    def _build_request(
+        self,
+        history: ConversationHistory,
+        schemas: list[dict[str, Any]],
+        *,
+        system_addendum: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build a provider-adapted request with an optional local control prompt."""
+        try:
+            request_history = self._history_for_request(history)
+            if system_addendum:
+                messages = request_history.messages
+                messages[0]["content"] += "\n\n" + system_addendum.strip()
+                request_history = ConversationHistory.from_messages(messages)
+            return self.context_manager.build_request(request_history, schemas)
+        except ContextBudgetError as exc:
+            raise AgentError(f"Cannot build model context: {exc}") from exc

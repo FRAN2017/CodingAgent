@@ -2,7 +2,7 @@ from typer.testing import CliRunner
 
 from coding_agent.agent import AgentError, AgentResult
 from coding_agent.checkpoints import CheckpointManager
-from coding_agent.cli import Provider, app, create_client
+from coding_agent.cli import AgentMode, Provider, app, create_client
 from coding_agent.llm_client import DeepSeekClient, QianwenClient
 
 runner = CliRunner()
@@ -26,6 +26,54 @@ def test_create_client_selects_qianwen(monkeypatch):
 
     assert isinstance(client, QianwenClient)
     assert model == "qianwen-test-model"
+
+
+def test_agent_mode_values_are_stable():
+    assert AgentMode.react.value == "react"
+    assert AgentMode.plan_execute.value == "plan-execute"
+
+
+def test_cli_selects_plan_execute_agent(tmp_path, monkeypatch):
+    instances = []
+
+    class FakePlanExecuteAgent:
+        def __init__(self, *args, **kwargs):
+            instances.append(self)
+
+        def run(self, task):
+            return AgentResult(
+                final_answer="planned",
+                steps=4,
+                tool_calls=3,
+                messages=[],
+                plan_id="plan-example",
+            )
+
+    monkeypatch.setattr(
+        "coding_agent.cli.create_client",
+        lambda provider: (object(), "test-model"),
+    )
+    monkeypatch.setattr(
+        "coding_agent.cli.PlanExecuteAgent",
+        FakePlanExecuteAgent,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "test task",
+            "--workspace",
+            str(tmp_path),
+            "--agent-mode",
+            "plan-execute",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(instances) == 1
+    assert "mode=plan-execute" in result.output
+    assert "plan=plan-example" in result.output
 
 
 def test_cli_prints_concise_agent_error_without_traceback(tmp_path, monkeypatch):
