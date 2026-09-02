@@ -29,6 +29,7 @@ from coding_agent.tools.workspace import path_uses_symlink
 
 MAX_DIFF_FILE_BYTES = 256 * 1024
 MAX_DIFF_CHARS = 40_000
+_UNSCOPED_SESSION = object()
 
 
 class CheckpointManager:
@@ -67,26 +68,58 @@ class CheckpointManager:
         self.last_checkpoint_id = checkpoint_id
         return document
 
-    def list(self) -> list[CheckpointDocument]:
-        return self.store.list()
+    def list(
+        self,
+        *,
+        session_id: object = _UNSCOPED_SESSION,
+    ) -> list[CheckpointDocument]:
+        """List every checkpoint, or only checkpoints owned by one session."""
+        documents = self.store.list()
+        if session_id is _UNSCOPED_SESSION:
+            return documents
+        return [
+            document
+            for document in documents
+            if document.session_id == session_id
+        ]
 
-    def get(self, checkpoint_id: str) -> CheckpointDocument:
-        return self.store.load(checkpoint_id)
+    def get(
+        self,
+        checkpoint_id: str,
+        *,
+        session_id: object = _UNSCOPED_SESSION,
+    ) -> CheckpointDocument:
+        document = self.store.load(checkpoint_id)
+        self._require_session_access(document, session_id)
+        return document
 
-    def latest(self) -> CheckpointDocument:
+    def latest(
+        self,
+        *,
+        session_id: object = _UNSCOPED_SESSION,
+    ) -> CheckpointDocument:
         if self.last_checkpoint_id is not None:
-            return self.store.load(self.last_checkpoint_id)
-        documents = self.list()
+            latest = self.store.load(self.last_checkpoint_id)
+            if self._belongs_to_session(latest, session_id):
+                return latest
+        documents = self.list(session_id=session_id)
         if not documents:
-            raise CheckpointError("No checkpoints are available")
+            raise CheckpointError(
+                self._no_checkpoint_message(session_id)
+            )
         self.last_checkpoint_id = documents[0].checkpoint_id
         return documents[0]
 
-    def diff(self, checkpoint_id: str | None = None) -> ChangeSet:
+    def diff(
+        self,
+        checkpoint_id: str | None = None,
+        *,
+        session_id: object = _UNSCOPED_SESSION,
+    ) -> ChangeSet:
         checkpoint = (
-            self.store.load(checkpoint_id)
+            self.get(checkpoint_id, session_id=session_id)
             if checkpoint_id is not None
-            else self.latest()
+            else self.latest(session_id=session_id)
         )
         current_files = scan_workspace(self.workspace)
         old_by_path = {entry.path: entry for entry in checkpoint.files}
@@ -159,11 +192,16 @@ class CheckpointManager:
         changes.sort(key=lambda change: (change.path, change.status))
         return ChangeSet(checkpoint.checkpoint_id, tuple(changes))
 
-    def restore(self, checkpoint_id: str | None = None) -> RestoreResult:
+    def restore(
+        self,
+        checkpoint_id: str | None = None,
+        *,
+        session_id: object = _UNSCOPED_SESSION,
+    ) -> RestoreResult:
         target = (
-            self.store.load(checkpoint_id)
+            self.get(checkpoint_id, session_id=session_id)
             if checkpoint_id is not None
-            else self.latest()
+            else self.latest(session_id=session_id)
         )
         target_content = {
             entry.path: self.store.read_object(entry) for entry in target.files
@@ -215,6 +253,33 @@ class CheckpointManager:
             restored_files=restored_files,
             removed_files=removed_files,
         )
+
+    @staticmethod
+    def _belongs_to_session(
+        document: CheckpointDocument,
+        session_id: object,
+    ) -> bool:
+        return (
+            session_id is _UNSCOPED_SESSION
+            or document.session_id == session_id
+        )
+
+    @classmethod
+    def _require_session_access(
+        cls,
+        document: CheckpointDocument,
+        session_id: object,
+    ) -> None:
+        if not cls._belongs_to_session(document, session_id):
+            raise CheckpointError(
+                "Checkpoint is not available in the current session"
+            )
+
+    @staticmethod
+    def _no_checkpoint_message(session_id: object) -> str:
+        if session_id is _UNSCOPED_SESSION:
+            return "No checkpoints are available"
+        return "No checkpoints are available in the current session"
 
     def _extract_renames(
         self,

@@ -1,10 +1,6 @@
 # coding-agent
 
 本项目的目标是从零实现一个简化的编程 Agent。模型通信可以使用普通的 OpenAI 兼容客户端，
-但 Agent Loop、工具调度、对话历史、上下文压缩、终止条件、错误处理和结果解析必须由项目自身实现。
-项目不允许使用 LangChain/LangGraph Memory、LlamaIndex、OpenAI/Claude Agents SDK、
-AutoGen、CrewAI，也不允许包装 Claude Code、Codex、OpenCode 等现成 Agent 产品。
-真实 API Key 只能保存在环境变量或未提交的 `.env` 中，禁止写入代码、README 或 Git 历史。
 
 ## 当前已实现能力
 
@@ -143,7 +139,6 @@ coding-agent/
 - 使用 `--workspace` 或 `-w` 指定 Agent 可访问的工作区；
 - 使用 `--max-steps` 限制最大模型轮次；
 - 使用 `--provider` 或 `-p` 选择模型提供商（`deepseek` 或 `qianwen`）；
-- 兼容旧的 `--model` 或 `-m` 参数别名；
 - 使用 `--session` 或 `-s` 创建或恢复工作区内的 JSON 会话；
 - 使用 `--agent-mode` 或 `-a` 选择 `react`（默认）或 `plan-execute`；
 - 支持用 `quit`、`exit`、`q` 或 `退出` 结束交互模式；
@@ -168,17 +163,19 @@ coding-agent/
 - `models.py`：定义版本化 manifest、文件记录、变更集合、恢复结果和 `CheckpointError`；
 - `scanner.py`：稳定扫描普通文件，排除受保护目录，拒绝符号链接并计算 SHA-256；
 - `store.py`：将文件原始字节按 SHA-256 去重保存，并原子写入检查点 manifest；
-- `manager.py`：创建和列出检查点，识别新增、修改、删除及重命名，生成 Unified Diff，并安全恢复；
+- `manager.py`：创建和按 Session 过滤检查点，校验检查点归属，识别新增、修改、删除及重命名，生成 Unified Diff，并安全恢复；
 - `__init__.py`：提供检查点包的稳定公开接口。
 
 检查点保存在 `<workspace>/.coding-agent/checkpoints/`，模型工具无法读取。任务开始前保存完整
 允许范围，因此 `run_command` 在工作区内产生的文件变化也能被发现和撤销。Undo 前会创建
 `pre_undo` 安全检查点，恢复完成后重新扫描并验证哈希。
 
-第一版最多扫描 20,000 个文件，单文件最大 32 MiB，总快照最大 256 MiB；超过限制或遇到
-非忽略路径中的符号链接时拒绝执行没有完整 Undo 保护的任务。`.env`、`.git`、`.coding-agent`、
-虚拟环境、依赖、缓存和构建目录不进入检查点，因此 Undo 不会改写这些状态。当前版本尚未实现
-并发恢复锁和自动清理旧检查点，检查点也可能包含项目源码，不应提交 `.coding-agent`。
+交互命令始终按当前 Session 隔离检查点：`/checkpoints` 只列出当前 Session 创建的记录，
+不带 ID 的 `/diff` 和 `/undo` 只选择当前 Session 的最新检查点，显式指定其他 Session 的
+检查点 ID 也会被拒绝。未使用 `--session` 时，只能看到同样未绑定 Session 的检查点。
+底层管理器保留无过滤接口，供内部维护和测试使用，但 CLI 不会通过该接口暴露其他 Session。
+
+
 
 #### `coding_agent/context/`
 
@@ -216,8 +213,7 @@ coding-agent/
 强制规划流程从“继续观察”转换到“提交结构化计划”。如果仍未提交，错误信息会列出每轮实际
 调用的工具，例如 `turn 1=[list_files]; turn 2=[search_text]`，便于定位模型能力或提示遵循问题。
 
-第一版不支持并行步骤、DAG 依赖、人工编辑计划和跨进程继续执行未完成计划；单个步骤最多使用
-5 次模型调用，失败时最多自动重新规划一次。计划 JSON 用于观察和审计，不会自动恢复中断执行。
+
 
 #### `coding_agent/sessions/`
 
@@ -423,7 +419,7 @@ system、user、assistant、tool 和 tool_calls 消息，而不是压缩后的�
 #### `tests/test_checkpoints.py`
 
 测试工作区检查点，包括新增、修改、删除和重命名检测、Unified Diff、完整恢复、Undo 前安全
-检查点、受保护状态排除、损坏对象拒绝恢复和符号链接拒绝。
+检查点、受保护状态排除、损坏对象拒绝恢复、符号链接拒绝和跨 Session 访问隔离。
 
 #### `tests/test_llm_client.py`
 
@@ -550,10 +546,6 @@ pip install -r requirement.txt
 
 ## 运行 Agent
 
-项目提供 `run-agent.ps1`，可以自动读取项目根目录的 `.env`、根据提供商校验 API Key、
-选择 `.venv` 中的 Python 并启动 Agent。默认提供商为 DeepSeek，也可通过
-`-Provider qianwen` 切换到 Qianwen。
-
 ### 持续交互模式
 
 启动时不提供任务，就会进入 `>>` 循环：
@@ -596,8 +588,10 @@ Restored cp-...
 Session ID 启动仍可继续原会话。不传 `-Session` 也能交互，但每个问题的历史彼此独立。
 
 每个普通任务开始前都会自动创建检查点。`/diff [checkpoint-id]` 查看差异，
-`/undo [checkpoint-id]` 在确认后恢复，`/checkpoints` 列出最近的检查点。省略 ID 时使用当前进程
-最近的检查点；重启后使用工作区中创建时间最新的检查点。Undo 只恢复工作区文件，不删除
+`/undo [checkpoint-id]` 在确认后恢复，`/checkpoints` 只列出当前 Session 的检查点。省略 ID 时
+使用当前 Session 在当前进程中最近的检查点；重启后使用该 Session 在工作区中创建时间最新的
+检查点。显式传入其他 Session 的检查点 ID 会被拒绝；不使用 `-Session` 时，只能操作无 Session
+检查点。Undo 只恢复工作区文件，不删除
 原始对话消息，并会先建立 `pre_undo` 安全检查点。恢复成功后自动向当前会话的
 `workspace_events` 写入本地事件；下一次请求会收到“文件内容可能过期，必须重新读取”的提示。
 未使用 `-Session` 时事件只保存在当前交互进程内，退出后不持久化。
@@ -783,8 +777,7 @@ examples/demo/.coding-agent/sessions/session-calculator.json
 
 ## 对话历史与上下文预算
 
-第一版上下文管理完全由项目代码实现，不使用 LangChain Memory、LlamaIndex、
-Agents SDK、AutoGen、CrewAI 等现成 Agent 或记忆模块。默认配置为：
+默认配置为：
 
 ```dotenv
 CODING_AGENT_CONTEXT_TOKENS=65536
@@ -808,8 +801,7 @@ Token 估算不依赖特定厂商 tokenizer，而是按 UTF-8 字节数偏保守
 
 启用 `--session` 后，原始完整历史会跨进程保存在 JSON 中，但每次发送给模型的仍然只是经过
 提供商转换和上下文预算处理的请求视图。
-当前第一版不提供长期语义记忆、向量检索、会话分支、并发会话锁或云端同步；后续能力仍应基于
-自有数据结构实现，而不是接入现成 Agent Memory。
+
 
 ## 命令执行安全边界
 

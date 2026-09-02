@@ -210,3 +210,33 @@ def test_interactive_diff_and_undo_commands_restore_workspace(tmp_path, monkeypa
     assert f"Restored {checkpoint.checkpoint_id}" in result.output
     assert "Workspace restore event recorded" in result.output
     assert target.read_text(encoding="utf-8") == "before\n"
+
+
+def test_interactive_checkpoints_only_lists_current_session(tmp_path, monkeypatch):
+    manager = CheckpointManager(tmp_path)
+    manager.create("visible alpha task", session_id="alpha")
+    hidden = manager.create("hidden beta task", session_id="beta")
+
+    class UnusedAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, task):
+            raise AssertionError("Slash commands must not be sent to the model")
+
+    monkeypatch.setattr(
+        "coding_agent.cli.create_client",
+        lambda provider: (object(), "test-model"),
+    )
+    monkeypatch.setattr("coding_agent.cli.Agent", UnusedAgent)
+
+    result = runner.invoke(
+        app,
+        ["run", "--workspace", str(tmp_path), "--session", "alpha"],
+        input=f"/checkpoints\n/diff {hidden.checkpoint_id}\nquit\n",
+    )
+
+    assert result.exit_code == 0
+    assert "visible alpha task" in result.output
+    assert "hidden beta task" not in result.output
+    assert "Checkpoint is not available in the current session" in result.output

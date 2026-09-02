@@ -89,8 +89,6 @@ def run(
         typer.Option(
             "--provider",
             "-p",
-            "--model",
-            "-m",
             help="Choose LLM provider (the --model alias is kept for compatibility)",
         ),
     ] = Provider.deepseek,
@@ -148,7 +146,7 @@ def run(
             _run_interactive(
                 agent,
                 checkpoint_manager,
-                persistent=session is not None,
+                session_id=session,
             )
             return
 
@@ -177,7 +175,7 @@ def _run_interactive(
     agent: Agent,
     checkpoint_manager: CheckpointManager,
     *,
-    persistent: bool,
+    session_id: str | None,
 ) -> None:
     console.print(
         "[bold green]Interactive mode[/bold green]  "
@@ -187,7 +185,7 @@ def _run_interactive(
     console.print(
         "[dim]Checkpoint commands: /diff, /undo, /checkpoints[/dim]"
     )
-    if not persistent:
+    if session_id is None:
         console.print(
             "[yellow]未提供 --session；每个问题将使用独立的对话历史。[/yellow]"
         )
@@ -206,7 +204,12 @@ def _run_interactive(
             continue
         if task.startswith("/"):
             try:
-                _handle_checkpoint_command(task, checkpoint_manager, agent)
+                _handle_checkpoint_command(
+                    task,
+                    checkpoint_manager,
+                    agent,
+                    session_id=session_id,
+                )
             except (CheckpointError, OSError, ValueError) as exc:
                 console.print(f"[bold red]Error:[/bold red] {exc}")
             continue
@@ -246,6 +249,8 @@ def _handle_checkpoint_command(
     command: str,
     checkpoint_manager: CheckpointManager,
     agent: Agent,
+    *,
+    session_id: str | None,
 ) -> None:
     parts = command.split()
     name = parts[0].casefold()
@@ -254,12 +259,17 @@ def _handle_checkpoint_command(
     checkpoint_id = parts[1] if len(parts) == 2 else None
 
     if name == "/diff":
-        _print_changes(checkpoint_manager.diff(checkpoint_id))
+        _print_changes(
+            checkpoint_manager.diff(
+                checkpoint_id,
+                session_id=session_id,
+            )
+        )
         return
     if name == "/checkpoints":
         if checkpoint_id is not None:
             raise ValueError("/checkpoints does not accept an id")
-        checkpoints = checkpoint_manager.list()
+        checkpoints = checkpoint_manager.list(session_id=session_id)
         if not checkpoints:
             console.print("[yellow]No checkpoints are available.[/yellow]")
             return
@@ -272,11 +282,17 @@ def _handle_checkpoint_command(
         return
     if name == "/undo":
         target = (
-            checkpoint_manager.get(checkpoint_id)
+            checkpoint_manager.get(
+                checkpoint_id,
+                session_id=session_id,
+            )
             if checkpoint_id is not None
-            else checkpoint_manager.latest()
+            else checkpoint_manager.latest(session_id=session_id)
         )
-        changes = checkpoint_manager.diff(target.checkpoint_id)
+        changes = checkpoint_manager.diff(
+            target.checkpoint_id,
+            session_id=session_id,
+        )
         _print_changes(changes)
         answer = console.input(
             f"[yellow]Restore {target.checkpoint_id}? [y/N][/yellow] "
@@ -284,7 +300,10 @@ def _handle_checkpoint_command(
         if answer.casefold() not in {"y", "yes"}:
             console.print("[yellow]Undo cancelled.[/yellow]")
             return
-        result = checkpoint_manager.restore(target.checkpoint_id)
+        result = checkpoint_manager.restore(
+            target.checkpoint_id,
+            session_id=session_id,
+        )
         _print_restore(result)
         agent.record_workspace_restore(result)
         console.print("[dim]Workspace restore event recorded.[/dim]")

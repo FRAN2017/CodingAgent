@@ -272,3 +272,6 @@ class Agent:
             return self.context_manager.build_request(request_history, schemas)
         except ContextBudgetError as exc:
             raise AgentError(f"Cannot build model context: {exc}") from exc
+
+#帮我实现一个Python项目，要求：1. 读取当前目录下所有其他文件；2. 统计每个文件的行数、单词数和字符数；3. 将结果按单词数降序排列；
+#输出为格式化的表格并保存为result.csv

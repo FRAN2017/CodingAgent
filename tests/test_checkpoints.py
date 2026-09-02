@@ -98,3 +98,36 @@ def test_checkpoint_rejects_workspace_symlink(tmp_path):
 
     with pytest.raises(CheckpointError, match="symbolic links"):
         CheckpointManager(tmp_path).create("scan symlink")
+
+
+def test_checkpoint_operations_are_scoped_to_session(tmp_path):
+    manager = CheckpointManager(tmp_path)
+    alpha = manager.create("alpha task", session_id="alpha")
+    beta = manager.create("beta task", session_id="beta")
+    anonymous = manager.create("anonymous task")
+
+    assert [item.checkpoint_id for item in manager.list(session_id="alpha")] == [
+        alpha.checkpoint_id
+    ]
+    assert [item.checkpoint_id for item in manager.list(session_id="beta")] == [
+        beta.checkpoint_id
+    ]
+    assert [item.checkpoint_id for item in manager.list(session_id=None)] == [
+        anonymous.checkpoint_id
+    ]
+    assert manager.latest(session_id="alpha").checkpoint_id == alpha.checkpoint_id
+
+    with pytest.raises(CheckpointError, match="current session"):
+        manager.get(beta.checkpoint_id, session_id="alpha")
+    with pytest.raises(CheckpointError, match="current session"):
+        manager.diff(beta.checkpoint_id, session_id="alpha")
+    with pytest.raises(CheckpointError, match="current session"):
+        manager.restore(beta.checkpoint_id, session_id="alpha")
+
+
+def test_checkpoint_session_scope_reports_when_no_checkpoint_exists(tmp_path):
+    manager = CheckpointManager(tmp_path)
+    manager.create("other task", session_id="other")
+
+    with pytest.raises(CheckpointError, match="current session"):
+        manager.latest(session_id="current")
